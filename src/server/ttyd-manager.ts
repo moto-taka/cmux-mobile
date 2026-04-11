@@ -149,11 +149,13 @@ export class TtydManager {
       }
     );
 
-    // Suppress noisy ttyd logs — only show errors
+    // Suppress noisy ttyd logs — only show critical errors
     proc.stdout?.on('data', () => {});
     proc.stderr?.on('data', (data: Buffer) => {
       const msg = data.toString();
-      if (msg.includes(' E: ') || msg.includes('error') || msg.includes('ERROR')) {
+      // Suppress common startup noise and expected port-in-use errors (ttyd will respawn)
+      if (msg.includes('EADDRINUSE')) return;
+      if (msg.includes(' E: ') && !msg.includes('EADDRINUSE')) {
         console.error(`[ttyd:${workspace.name}:${port}] ${msg.trim()}`);
       }
     });

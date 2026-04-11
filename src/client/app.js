@@ -275,6 +275,14 @@
         li.appendChild(statusText);
       }
 
+      if (wsObj.latest_log) {
+        const logEl = document.createElement('span');
+        logEl.className = 'ws-latest-log';
+        logEl.textContent = wsObj.latest_log;
+        logEl.title = wsObj.latest_log;
+        li.appendChild(logEl);
+      }
+
       li.addEventListener('click', () => selectWorkspace(wsObj.id));
       workspaceList.appendChild(li);
     });
