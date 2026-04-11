@@ -1,17 +1,73 @@
-/spawn-teamで並列作業すること
-ローカルのcmuxを外出しても作業を続けられるmobileアプリ(tailscaleとかでweb経由でいい)を作りたい
-https://cmux.com/ja/docs/getting-started のドキュメントをすべて読む
-cmuxのUIを完全に理解する
+# cmux-mobile
 
-ttydとかなにつかうかまで決めて実装まで完遂して。未定の箇所は全部決めていい
-bestで変更につよく使いやすいを目指す
+スマホブラウザからcmuxワークスペースのターミナルにアクセスするモバイルWebアプリ。
 
-npx cmux-mobile start
-  → Nodeサーバー起動
-  → cmux socketからworkspace.list等を購読
-  → 各workspaceにttydプロセスを立てる
-  → このWebUIを配信
-  → スマホから http://<IP>:3456 でアクセス
-  
-  メイン画面 = 常にターミナル。左上のハンバーガーメニューからサイドバーが左からスライドインして、ワークスペース一覧が出ます。各ワークスペースにはステータスドット・git branch・最新ログが表示され、タップで切り替わってサイドバーが閉じます。
-  ペインの切り替えはヘッダー直下のタブ（surfaceが複数ある場合のみ表示）、サイドバー情報（cwd, status, progress, log）は右上の「ℹ」ボタンでトグルです。
+## 必要条件
+
+- Node.js 18+
+- [cmux](https://cmux.com) が起動中でSocket APIが有効
+- ttyd (`brew install ttyd`)
+
+## 使い方
+
+```bash
+# 開発モード
+npx tsx src/server/index.ts start
+
+# ビルドして実行
+npm run build
+npm start
+
+# オプション指定
+npx tsx src/server/index.ts start --port 8080 --socket-path /tmp/cmux.sock
+```
+
+スマホから `http://<PCのIP>:3456` にアクセス。
+
+## アーキテクチャ
+
+```
+スマホブラウザ
+  │
+  ├─ HTTP :3456 ─→ Fastify Server
+  │                  ├─ 静的ファイル配信 (HTML/CSS/JS)
+  │                  ├─ WebSocket /ws (リアルタイム更新)
+  │                  └─ REST API /api/*
+  │
+  └─ HTTP :9001+ ─→ ttyd (各workspaceのターミナル)
+                      │
+                      └─ bash (workspaceのcwd)
+
+Fastify Server
+  ├─ cmux-socket.ts ─→ Unix Socket (/tmp/cmux.sock) ─→ cmux
+  ├─ ttyd-manager.ts ─→ ttydプロセス管理 (per workspace)
+  └─ index.ts ─→ HTTP/WS サーバー
+```
+
+## UI
+
+- **メイン画面**: 常にターミナル (ttyd iframe)
+- **☰ ハンバーガー**: 左からサイドバーがスライドイン → ワークスペース一覧
+  - ステータスドット (緑=idle, 黄=running, 赤=error)
+  - git branch表示
+  - タップでワークスペース切替
+- **サーフェスタブ**: 複数ペインがある場合のみ表示
+- **ℹ ボタン**: 下から情報パネル (cwd, branch, status, progress, log)
+- **スワイプ**: 左スワイプでサイドバー閉じ
+
+## 設定
+
+| 環境変数 | デフォルト | 説明 |
+|---------|-----------|------|
+| `CMUX_SOCKET_PATH` | `/tmp/cmux.sock` | cmuxソケットのパス |
+
+| オプション | デフォルト | 説明 |
+|-----------|-----------|------|
+| `--port` | 3456 | サーバーポート |
+| `--host` | 0.0.0.0 | バインドホスト |
+| `--socket-path` | `/tmp/cmux.sock` | cmuxソケットパス |
+| `--ttyd-base-port` | 9001 | ttyd開始ポート |
+
+## リモートアクセス
+
+Tailscale等で同一ネットワークに接続後、通常通りアクセス可能。

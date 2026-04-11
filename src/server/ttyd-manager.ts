@@ -148,21 +148,18 @@ export class TtydManager {
       }
     );
 
-    proc.stdout?.on('data', (data: Buffer) => {
-      console.debug(`[ttyd:${workspace.name}:${port}] ${data.toString().trim()}`);
-    });
-
+    // Suppress noisy ttyd logs — only show errors
+    proc.stdout?.on('data', () => {});
     proc.stderr?.on('data', (data: Buffer) => {
-      console.debug(`[ttyd:${workspace.name}:${port}] ${data.toString().trim()}`);
+      const msg = data.toString();
+      if (msg.includes(' E: ') || msg.includes('error') || msg.includes('ERROR')) {
+        console.error(`[ttyd:${workspace.name}:${port}] ${msg.trim()}`);
+      }
     });
 
     proc.on('exit', (code, signal) => {
-      console.debug(
-        `[ttyd:${workspace.name}:${port}] exited with code=${code} signal=${signal}`
-      );
       // Auto-respawn if not shutting down and process is still tracked
       if (!this.shuttingDown && this.processes.has(workspace.id)) {
-        console.debug(`[ttyd:${workspace.name}:${port}] respawning...`);
         this.processes.delete(workspace.id);
         // Reclaim the port for reuse
         this.spawnTtyd(workspace).catch((err) => {

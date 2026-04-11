@@ -321,6 +321,19 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   // Initial refresh
   await refreshWorkspaces();
 
+  // Show workspace summary
+  if (workspaces.length > 0) {
+    console.log(`   ✓ ${workspaces.length} workspaces found:`);
+    for (const ws of workspaces) {
+      const info = ttyd.getInfo(ws.id);
+      const branch = ws.git_branch ? ` (${ws.git_branch})` : '';
+      const ttydPort = info ? ` → :${info.port}` : '';
+      console.log(`     - ${ws.name}${branch}${ttydPort}`);
+    }
+  } else {
+    console.log('   ⚠ No workspaces found');
+  }
+
   // Start HTTP server
   await fastify.listen({ port: fullConfig.port, host: fullConfig.host });
 
