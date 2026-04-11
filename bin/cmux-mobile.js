@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // cmux-mobile CLI entry point
-import { createServer } from '../dist/server/index.mjs';
+import { createServer } from '../dist/server/index.js';
 
 const args = process.argv.slice(2);
 
-function parseArgs() {
+function parseArgs(argList) {
   const opts = {
     port: 3456,
     host: '0.0.0.0',
@@ -12,20 +12,44 @@ function parseArgs() {
     ttydBasePort: 9001,
   };
 
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case '--port':
-        opts.port = parseInt(args[++i], 10);
+  for (let i = 0; i < argList.length; i++) {
+    switch (argList[i]) {
+      case '--port': {
+        const val = argList[++i];
+        if (!val || isNaN(Number(val))) {
+          console.error('Error: --port requires a numeric value');
+          process.exit(1);
+        }
+        opts.port = parseInt(val, 10);
         break;
-      case '--host':
-        opts.host = args[++i];
+      }
+      case '--host': {
+        const val = argList[++i];
+        if (!val) {
+          console.error('Error: --host requires a value');
+          process.exit(1);
+        }
+        opts.host = val;
         break;
-      case '--socket-path':
-        opts.socketPath = args[++i];
+      }
+      case '--socket-path': {
+        const val = argList[++i];
+        if (!val) {
+          console.error('Error: --socket-path requires a value');
+          process.exit(1);
+        }
+        opts.socketPath = val;
         break;
-      case '--ttyd-base-port':
-        opts.ttydBasePort = parseInt(args[++i], 10);
+      }
+      case '--ttyd-base-port': {
+        const val = argList[++i];
+        if (!val || isNaN(Number(val))) {
+          console.error('Error: --ttyd-base-port requires a numeric value');
+          process.exit(1);
+        }
+        opts.ttydBasePort = parseInt(val, 10);
         break;
+      }
       case '--help':
         console.log(`
 cmux-mobile - Access cmux workspaces from your smartphone
@@ -51,7 +75,7 @@ Environment Variables:
 const command = args[0];
 
 if (command === 'start') {
-  const opts = parseArgs();
+  const opts = parseArgs(args.slice(1));
   createServer(opts).catch((err) => {
     console.error('Failed to start cmux-mobile:', err);
     process.exit(1);

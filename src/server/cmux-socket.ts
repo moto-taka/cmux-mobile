@@ -174,14 +174,23 @@ export class CmuxSocketClient {
       };
     });
 
-    // Fetch surfaces for each workspace in parallel
+    // Fetch surfaces and sidebar state for each workspace in parallel
     const enriched = await Promise.all(
       workspaces.map(async (ws) => {
-        const [surfaces, gitBranch] = await Promise.all([
+        const [surfaces, gitBranch, sidebarData] = await Promise.all([
           this.listSurfaces(ws.id).catch(() => [] as Surface[]),
           this.getGitBranch(ws.cwd),
+          this.getSidebarState(ws.id),
         ]);
-        return { ...ws, surfaces, git_branch: gitBranch };
+        return {
+          ...ws,
+          surfaces,
+          git_branch: gitBranch,
+          // Enrich with sidebar state if available, otherwise keep spinner-based status
+          status: (sidebarData?.status as string) || ws.status,
+          progress: (sidebarData?.progress as number) ?? ws.progress,
+          latest_log: (sidebarData?.latest_log as string) || ws.latest_log,
+        };
       }),
     );
 
@@ -279,6 +288,15 @@ export class CmuxSocketClient {
 
   async sidebarState(workspaceId: string): Promise<unknown> {
     return this.request('sidebar.sidebar_state', { workspace_id: workspaceId });
+  }
+
+  private async getSidebarState(workspaceId: string): Promise<Record<string, unknown> | null> {
+    try {
+      const result = await this.request('sidebar.sidebar_state', { workspace_id: workspaceId }) as Record<string, unknown>;
+      return result;
+    } catch {
+      return null;
+    }
   }
 
   // ─── Event emitter ───
