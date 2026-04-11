@@ -153,6 +153,13 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── REST API ───
 
+  fastify.get('/api/health', async () => ({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    workspaces: workspaces.length,
+    cmux: cmux.isConnected,
+  }));
+
   fastify.get('/api/workspaces', async () => workspaces);
 
   fastify.post('/api/workspaces/:id/select', async (req) => {

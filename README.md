@@ -71,3 +71,10 @@ Fastify Server
 ## リモートアクセス
 
 Tailscale等で同一ネットワークに接続後、通常通りアクセス可能。
+
+## テスト
+
+```bash
+npm test          # テスト実行
+npm run typecheck # 型チェック
+```

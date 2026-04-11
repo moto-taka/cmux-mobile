@@ -314,12 +314,26 @@
     const wsObj = getWorkspace(currentWorkspaceId);
     if (!wsObj) return;
 
-    // Direct ttyd access using the ttyd port (same host, different port)
-    // This works on local network and Tailscale
     if (wsObj.ttydPort) {
       const url = 'http://' + location.hostname + ':' + wsObj.ttydPort + '/';
       if (ttydFrame.src !== url) {
-        ttydFrame.src = url;
+        showLoading();
+        // Verify ttyd is reachable before loading the iframe
+        fetch(url, { mode: 'no-cors', cache: 'no-store' })
+          .then(() => {
+            ttydFrame.src = url;
+            showTerminal();
+          })
+          .catch(() => {
+            // ttyd not reachable — show error after a brief delay for transient issues
+            setTimeout(() => {
+              // Only show error if this workspace is still selected
+              const current = getWorkspace(currentWorkspaceId);
+              if (current && current.ttydPort === wsObj.ttydPort) {
+                showError();
+              }
+            }, 2000);
+          });
       }
     }
   }
