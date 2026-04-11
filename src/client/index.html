@@ -19,7 +19,10 @@
   <aside id="sidebar" class="sidebar" aria-label="Workspaces">
     <div class="sidebar-header">
       <span class="sidebar-title">Workspaces</span>
-      <button id="sidebar-close" class="icon-btn" aria-label="Close sidebar">&times;</button>
+      <div class="sidebar-actions">
+        <button id="refresh-btn" class="icon-btn" aria-label="Refresh workspaces">&#8635;</button>
+        <button id="sidebar-close" class="icon-btn" aria-label="Close sidebar">&times;</button>
+      </div>
     </div>
     <ul id="workspace-list" class="workspace-list"></ul>
   </aside>
@@ -69,6 +72,7 @@
   </div>
 
   <script src="app.js"></script>
+  <div id="toast-container" class="toast-container"></div>
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch(() => {});

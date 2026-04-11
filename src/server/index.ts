@@ -3,10 +3,12 @@ import fastifyStatic from '@fastify/static';
 import fastifyWebSocket from '@fastify/websocket';
 import { CmuxSocketClient } from './cmux-socket.js';
 import { TtydManager } from './ttyd-manager.js';
-import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../shared/types.js';
+import crypto from 'crypto';
+import type { ServerConfig, Workspace, ServerMessage, ClientMessage, ActiveViewChange, ClientInfo } from '../shared/types.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
+import qrcode from 'qrcode-terminal';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,7 +25,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   const cmux = new CmuxSocketClient({ socketPath: fullConfig.socketPath });
   const ttyd = new TtydManager(fullConfig.ttydBasePort);
-  const clients = new Set<any>();
+  const clients = new Map<string, { socket: any; clientId: string; currentWorkspaceId: string | null; currentSurfaceId: string | null }>();
   let workspaces: Workspace[] = [];
 
   // ─── Fastify Setup ───
@@ -38,16 +40,16 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── Broadcast ───
 
-  function broadcast(message: ServerMessage) {
+  function broadcast(message: ServerMessage, excludeClientId?: string) {
     const data = JSON.stringify(message);
-    for (const client of clients) {
+    for (const [id, client] of clients) {
+      if (id === excludeClientId) continue;
       try {
-        if ((client as any).readyState === 1) {
-          client.send(data);
+        if (client.socket.readyState === 1) {
+          client.socket.send(data);
         }
       } catch {
-        // Individual client send failure — remove dead client
-        clients.delete(client);
+        clients.delete(id);
       }
     }
   }
@@ -56,35 +58,53 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   fastify.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, (socket, _req) => {
-      clients.add(socket);
+      const clientId = crypto.randomUUID();
+      clients.set(clientId, {
+        socket,
+        clientId,
+        currentWorkspaceId: null,
+        currentSurfaceId: null,
+      });
 
       socket.send(JSON.stringify({
         type: 'connected',
-        data: { port: fullConfig.port, ttydBasePort: fullConfig.ttydBasePort },
+        data: { port: fullConfig.port, ttydBasePort: fullConfig.ttydBasePort, clientId },
       }));
 
       if (workspaces.length > 0) {
         socket.send(JSON.stringify({ type: 'workspaces', data: workspaces }));
       }
 
+      // Notify new client about other clients' current view state
+      for (const [id, client] of clients) {
+        if (id === clientId) continue;
+        if (client.currentWorkspaceId) {
+          socket.send(JSON.stringify({
+            type: 'active_view_change',
+            data: { clientId: client.clientId, workspaceId: client.currentWorkspaceId, surfaceId: client.currentSurfaceId },
+          }));
+        }
+      }
+
       socket.on('message', async (raw: any) => {
         try {
           const msg: ClientMessage = JSON.parse(raw.toString());
-          await handleClientMessage(msg);
+          await handleClientMessage(msg, clientId);
         } catch (err) {
           socket.send(JSON.stringify({ type: 'error', data: String(err) }));
         }
       });
 
       socket.on('close', () => {
-        clients.delete(socket);
+        clients.delete(clientId);
+        broadcast({ type: 'active_view_change', data: { clientId, workspaceId: null, surfaceId: null } });
       });
     });
   });
 
   // ─── Client message handler ───
 
-  async function handleClientMessage(msg: ClientMessage) {
+  async function handleClientMessage(msg: ClientMessage, clientId: string) {
     switch (msg.type) {
       case 'select_workspace': {
         const { workspaceId } = msg.data as { workspaceId: string };
@@ -108,6 +128,19 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
       }
       case 'refresh': {
         await refreshWorkspaces();
+        break;
+      }
+      case 'view_changed': {
+        const { workspaceId, surfaceId } = msg.data as { workspaceId: string | null; surfaceId: string | null };
+        const client = clients.get(clientId);
+        if (client) {
+          client.currentWorkspaceId = workspaceId;
+          client.currentSurfaceId = surfaceId ?? null;
+        }
+        broadcast(
+          { type: 'active_view_change', data: { clientId, workspaceId: workspaceId ?? null, surfaceId: surfaceId ?? null } },
+          clientId,
+        );
         break;
       }
     }
@@ -224,9 +257,15 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   console.log('\n📱 Access from your phone:');
   for (const ip of ips) {
-    console.log(`   http://${ip}:${fullConfig.port}`);
+    const url = `http://${ip}:${fullConfig.port}`;
+    console.log(`   ${url}`);
+    console.log();
+    qrcode.generate(url, { small: true }, (qr: string) => {
+      console.log(qr);
+    });
+    console.log();
   }
-  console.log(`\n   Local: http://localhost:${fullConfig.port}\n`);
+  console.log(`   Local: http://localhost:${fullConfig.port}\n`);
 
   // ─── Graceful shutdown ───
 

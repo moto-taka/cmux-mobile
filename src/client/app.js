@@ -15,6 +15,9 @@
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 50;
 
+  let clientId = null;
+  let isApplyingRemoteChange = false;
+
   // ─── DOM refs ───
 
   const $ = (sel) => document.querySelector(sel);
@@ -25,6 +28,7 @@
   const menuBtn = $('#menu-btn');
   const workspaceName = $('#workspace-name');
   const infoBtn = $('#info-btn');
+  const refreshBtn = $('#refresh-btn');
   const infoPanel = $('#info-panel');
   const infoClose = $('#info-close');
   const infoContent = $('#info-content');
@@ -34,6 +38,7 @@
   const errorScreen = $('#error-screen');
   const retryBtn = $('#retry-btn');
   const connStatus = $('#conn-status');
+  const toastContainer = $('#toast-container');
 
   function showLoading() {
     loadingScreen.classList.remove('hidden');
@@ -60,6 +65,21 @@
     connStatus.title = state === 'connected' ? 'Connected' : state === 'connecting' ? 'Connecting...' : 'Disconnected';
   }
 
+  // ─── Toast Notifications ───
+
+  function showToast(message, type) {
+    // type: 'info' (default), 'error', 'success'
+    const toast = document.createElement('div');
+    toast.className = 'toast' + (type ? ' ' + type : '');
+    toast.textContent = message;
+    toastContainer.appendChild(toast);
+
+    setTimeout(() => {
+      toast.classList.add('toast-out');
+      toast.addEventListener('animationend', () => toast.remove());
+    }, 2500);
+  }
+
   // ─── WebSocket ───
 
   function connectWS() {
@@ -73,6 +93,7 @@
       console.log('[cmux] WebSocket connected');
       setConnStatus('connected');
       reconnectAttempts = 0;
+      showToast('Connected', 'success');
     };
 
     ws.onmessage = (event) => {
@@ -87,6 +108,7 @@
     ws.onclose = () => {
       console.log('[cmux] WebSocket closed, reconnecting...');
       setConnStatus('');
+      showToast('Disconnected — reconnecting...', 'error');
       if (workspaces.length === 0) showError();
       scheduleReconnect();
     };
@@ -137,11 +159,26 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case 'connected':
-        console.log('[cmux] Connected to server');
+        clientId = msg.data.clientId || null;
+        console.log('[cmux] Connected to server, clientId:', clientId);
         break;
       case 'workspaces':
         workspaces = msg.data || [];
         renderSidebar();
+
+        // URL hash からの復元を試行
+        const hashState = readHash();
+        if (hashState.workspaceId) {
+          const exists = workspaces.find(w => w.id === hashState.workspaceId);
+          if (exists) {
+            selectWorkspace(hashState.workspaceId);
+            if (hashState.surfaceId) selectSurface(hashState.surfaceId);
+            showTerminal();
+            break;
+          }
+        }
+
+        // フォールバック: 最初のworkspaceを自動選択
         if (!currentWorkspaceId && workspaces.length > 0) {
           selectWorkspace(workspaces[0].id);
           showTerminal();
@@ -161,7 +198,36 @@
         break;
       case 'error':
         console.error('[cmux] Server error:', msg.data);
+        showToast(String(msg.data), 'error');
         break;
+      case 'active_view_change': {
+        const change = msg.data;
+        // 自分の変更のエコーバックは無視
+        if (change.clientId === clientId) break;
+
+        // ミラーモード: 他クライアントの選択状態を適用
+        isApplyingRemoteChange = true;
+        try {
+          if (change.workspaceId && change.workspaceId !== currentWorkspaceId) {
+            currentWorkspaceId = change.workspaceId;
+            const wsObj = getWorkspace(currentWorkspaceId);
+            if (wsObj) {
+              workspaceName.textContent = wsObj.name;
+            }
+            renderSidebar();
+          }
+          if (change.surfaceId && change.surfaceId !== currentSurfaceId) {
+            currentSurfaceId = change.surfaceId;
+          }
+          renderSurfaceTabs();
+          updateTtydFrame();
+          updateInfoPanel();
+          updateHash();
+        } finally {
+          isApplyingRemoteChange = false;
+        }
+        break;
+      }
     }
   }
 
@@ -196,12 +262,17 @@
     renderSurfaceTabs();
     updateTtydFrame();
     updateInfoPanel();
+    updateHash();
     closeSidebar();
 
     send({ type: 'select_workspace', data: { workspaceId } });
     if (currentSurfaceId) {
       send({ type: 'select_surface', data: { workspaceId, surfaceId: currentSurfaceId } });
     }
+    if (clientId && !isApplyingRemoteChange) {
+      send({ type: 'view_changed', data: { clientId, workspaceId, surfaceId: currentSurfaceId } });
+    }
+    showToast(wsObj ? wsObj.name : workspaceId);
   }
 
   function selectSurface(surfaceId) {
@@ -209,10 +280,32 @@
     currentSurfaceId = surfaceId;
     renderSurfaceTabs();
     updateTtydFrame();
+    updateHash();
 
     if (currentWorkspaceId) {
       send({ type: 'select_surface', data: { workspaceId: currentWorkspaceId, surfaceId } });
     }
+    if (clientId && !isApplyingRemoteChange) {
+      send({ type: 'view_changed', data: { clientId, workspaceId: currentWorkspaceId, surfaceId } });
+    }
+  }
+
+  // ─── URL Hash Management ───
+
+  function updateHash() {
+    const parts = [];
+    if (currentWorkspaceId) parts.push('ws=' + currentWorkspaceId);
+    if (currentSurfaceId) parts.push('surface=' + currentSurfaceId);
+    location.hash = parts.length > 0 ? parts.join('&') : '';
+  }
+
+  function readHash() {
+    const hash = location.hash.slice(1);
+    const params = new URLSearchParams(hash);
+    return {
+      workspaceId: params.get('ws'),
+      surfaceId: params.get('surface'),
+    };
   }
 
   // ─── Rendering ───
@@ -505,11 +598,28 @@
     }
   }
 
+  // ─── Refresh workspaces ───
+
+  let refreshing = false;
+
+  function refreshWorkspaces() {
+    if (refreshing) return;
+    refreshing = true;
+    refreshBtn.classList.add('spinning');
+    send({ type: 'refresh', data: {} });
+    // Stop spinner after 2s regardless (server response comes via WS update)
+    setTimeout(() => {
+      refreshing = false;
+      refreshBtn.classList.remove('spinning');
+    }, 2000);
+  }
+
   // ─── Event Bindings ───
 
   menuBtn.addEventListener('click', openSidebar);
   sidebarClose.addEventListener('click', closeSidebar);
   overlay.addEventListener('click', closeSidebar);
+  refreshBtn.addEventListener('click', refreshWorkspaces);
 
   infoBtn.addEventListener('click', toggleInfoPanel);
   infoClose.addEventListener('click', closeInfoPanel);
@@ -518,6 +628,16 @@
   document.addEventListener('touchend', onTouchEnd, { passive: true });
 
   document.addEventListener('visibilitychange', onVisibilityChange);
+
+  window.addEventListener('hashchange', () => {
+    const { workspaceId, surfaceId } = readHash();
+    if (workspaceId && workspaceId !== currentWorkspaceId) {
+      selectWorkspace(workspaceId);
+    }
+    if (surfaceId && surfaceId !== currentSurfaceId) {
+      selectSurface(surfaceId);
+    }
+  });
 
   retryBtn.addEventListener('click', () => {
     clearReconnectTimer();

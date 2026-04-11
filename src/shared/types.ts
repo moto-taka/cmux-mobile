@@ -24,13 +24,27 @@ export interface Surface {
 // ─── Server ↔ Client Messages ───
 
 export interface ServerMessage {
-  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'error';
+  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'active_view_change' | 'error';
   data: unknown;
 }
 
 export interface ClientMessage {
-  type: 'select_workspace' | 'select_surface' | 'send_text' | 'send_key' | 'refresh';
+  type: 'select_workspace' | 'select_surface' | 'send_text' | 'send_key' | 'refresh' | 'view_changed';
   data: unknown;
+}
+
+// ─── View Sync (Mirror Mode) ───
+
+export interface ActiveViewChange {
+  clientId: string;
+  workspaceId: string;
+  surfaceId?: string;
+}
+
+export interface ClientInfo {
+  clientId: string;
+  currentWorkspaceId: string | null;
+  currentSurfaceId: string | null;
 }
 
 // ─── Config ───
