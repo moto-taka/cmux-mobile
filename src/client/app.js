@@ -29,16 +29,48 @@
   const infoContent = $('#info-content');
   const surfaceTabs = $('#surface-tabs');
   const ttydFrame = $('#ttyd-frame');
+  const loadingScreen = $('#loading-screen');
+  const errorScreen = $('#error-screen');
+  const retryBtn = $('#retry-btn');
+  const connStatus = $('#conn-status');
+
+  function showLoading() {
+    loadingScreen.classList.remove('hidden');
+    errorScreen.style.display = 'none';
+    ttydFrame.style.display = 'none';
+  }
+
+  function showError() {
+    loadingScreen.classList.add('hidden');
+    errorScreen.style.display = 'flex';
+    ttydFrame.style.display = 'none';
+    connStatus.className = 'conn-status';
+    connStatus.title = 'Disconnected';
+  }
+
+  function showTerminal() {
+    loadingScreen.classList.add('hidden');
+    errorScreen.style.display = 'none';
+    ttydFrame.style.display = 'block';
+  }
+
+  function setConnStatus(state) {
+    connStatus.className = 'conn-status ' + state;
+    connStatus.title = state === 'connected' ? 'Connected' : state === 'connecting' ? 'Connecting...' : 'Disconnected';
+  }
 
   // ─── WebSocket ───
 
   function connectWS() {
+    setConnStatus('connecting');
+    showLoading();
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${location.host}/ws`;
     ws = new WebSocket(url);
 
     ws.onopen = () => {
       console.log('[cmux] WebSocket connected');
+      setConnStatus('connected');
     };
 
     ws.onmessage = (event) => {
@@ -52,6 +84,8 @@
 
     ws.onclose = () => {
       console.log('[cmux] WebSocket closed, reconnecting in 3s...');
+      setConnStatus('');
+      if (workspaces.length === 0) showError();
       scheduleReconnect();
     };
 
@@ -66,6 +100,13 @@
       reconnectTimer = null;
       connectWS();
     }, 3000);
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
   }
 
   function send(msg) {
@@ -87,9 +128,11 @@
         renderSidebar();
         if (!currentWorkspaceId && workspaces.length > 0) {
           selectWorkspace(workspaces[0].id);
+          showTerminal();
         } else if (currentWorkspaceId) {
           renderSurfaceTabs();
           updateTtydFrame();
+          showTerminal();
         }
         break;
       case 'workspace_update':
@@ -401,6 +444,11 @@
 
   document.addEventListener('touchstart', onTouchStart, { passive: true });
   document.addEventListener('touchend', onTouchEnd, { passive: true });
+
+  retryBtn.addEventListener('click', () => {
+    clearReconnectTimer();
+    connectWS();
+  });
 
   // ─── Init ───
 

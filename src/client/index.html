@@ -29,6 +29,7 @@
       <div class="header-left">
         <button id="menu-btn" class="icon-btn" aria-label="Open menu">&#9776;</button>
         <span id="workspace-name" class="workspace-name">cmux</span>
+        <span id="conn-status" class="conn-status" title="Disconnected"></span>
       </div>
       <div class="header-right">
         <button id="info-btn" class="icon-btn" aria-label="Toggle info panel">&#8505;</button>
@@ -40,7 +41,17 @@
 
     <!-- Terminal area -->
     <div class="terminal-area">
-      <iframe id="ttyd-frame" class="ttyd-frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+      <div id="loading-screen" class="loading-screen">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Connecting to cmux...</div>
+      </div>
+      <div id="error-screen" class="error-screen" style="display:none">
+        <div class="error-icon">&#9888;</div>
+        <div class="error-text">Unable to connect</div>
+        <div class="error-hint">Make sure cmux is running and the server is started</div>
+        <button id="retry-btn" class="retry-btn">Retry</button>
+      </div>
+      <iframe id="ttyd-frame" class="ttyd-frame" style="display:none" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
     </div>
   </div>
 
