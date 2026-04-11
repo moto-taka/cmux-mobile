@@ -1,0 +1,6 @@
+*.test.ts
+*.test.js
+*.map
+build-sw-cache.mjs
+tsconfig.json
+tsup.config.ts
