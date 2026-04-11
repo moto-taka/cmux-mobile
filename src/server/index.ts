@@ -255,8 +255,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   return fastify;
 }
 
-// Direct execution support (for npx tsx src/server/index.ts start)
+// Direct execution support (tsx dev or node dist)
 const args = process.argv.slice(2);
-if (args[0] === 'start' && process.argv[1]?.includes('index.ts')) {
+if (args[0] === 'start') {
   createServer().catch(console.error);
 }

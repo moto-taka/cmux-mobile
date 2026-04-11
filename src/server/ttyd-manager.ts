@@ -149,22 +149,20 @@ export class TtydManager {
       }
     );
 
-    // Suppress noisy ttyd logs — only show critical errors
+    // Suppress noisy ttyd logs — only show real errors
     proc.stdout?.on('data', () => {});
     proc.stderr?.on('data', (data: Buffer) => {
       const msg = data.toString();
-      // Suppress common startup noise and expected port-in-use errors (ttyd will respawn)
       if (msg.includes('EADDRINUSE')) return;
-      if (msg.includes(' E: ') && !msg.includes('EADDRINUSE')) {
+      if (msg.includes(' E: ')) {
         console.error(`[ttyd:${workspace.name}:${port}] ${msg.trim()}`);
       }
     });
 
-    proc.on('exit', (code, signal) => {
+    proc.on('exit', () => {
       // Auto-respawn if not shutting down and process is still tracked
       if (!this.shuttingDown && this.processes.has(workspace.id)) {
         this.processes.delete(workspace.id);
-        // Reclaim the port for reuse
         this.spawnTtyd(workspace).catch((err) => {
           console.error(`[ttyd:${workspace.name}] respawn failed: ${err.message}`);
         });
@@ -184,7 +182,7 @@ export class TtydManager {
   }
 
   private async killProcess(
-    workspaceId: string,
+    _workspaceId: string,
     info: TtydProcessInfo
   ): Promise<void> {
     return new Promise((resolve) => {

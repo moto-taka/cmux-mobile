@@ -464,19 +464,21 @@
   function onTouchEnd(e) {
     const touch = e.changedTouches[0];
     const dx = touch.clientX - touchStartX;
-    const dy = Math.abs(touch.clientY - touchStartY);
+    const rawDy = touch.clientY - touchStartY;
+    const ady = Math.abs(rawDy);
     const dt = Date.now() - touchStartTime;
 
-    // Ignore slow swipes and vertical scrolls
-    if (dy > Math.abs(dx) || dt > 500) return;
+    // Swipe down on info panel to close (vertical swipe)
+    if (infoPanelOpen && rawDy > 50 && ady > Math.abs(dx)) {
+      closeInfoPanel();
+      return;
+    }
+
+    // Ignore slow swipes and non-horizontal movements for sidebar
+    if (ady > Math.abs(dx) || dt > 500) return;
 
     if (sidebarOpen && dx < -50) {
       closeSidebar();
-    }
-
-    // Swipe down on info panel to close
-    if (infoPanelOpen && dy < Math.abs(dx) === false && (touch.clientY - touchStartY) > 50) {
-      closeInfoPanel();
     }
   }
 
