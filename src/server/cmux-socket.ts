@@ -18,6 +18,7 @@ const DEFAULT_SOCKET_PATH = '/tmp/cmux.sock';
 const RECONNECT_BASE_DELAY = 3000;
 const MAX_RECONNECT_DELAY = 30000;
 const REQUEST_TIMEOUT = 10000;
+const GIT_BRANCH_CACHE_TTL = 30_000; // 30 seconds
 
 export class CmuxSocketClient {
   private socket: net.Socket | null = null;
@@ -34,6 +35,7 @@ export class CmuxSocketClient {
   private readonly socketPath: string;
   private readonly pollInterval: number;
   private readonly listeners = new Map<string, Set<EventCallback>>();
+  private readonly branchCache = new Map<string, { branch: string | undefined; ts: number }>();
 
   constructor(options: CmuxSocketClientOptions = {}) {
     this.socketPath = options.socketPath ?? process.env.CMUX_SOCKET_PATH ?? DEFAULT_SOCKET_PATH;
@@ -220,13 +222,21 @@ export class CmuxSocketClient {
   // ─── Private helpers ───
 
   private async getGitBranch(cwd: string): Promise<string | undefined> {
+    const cached = this.branchCache.get(cwd);
+    if (cached && Date.now() - cached.ts < GIT_BRANCH_CACHE_TTL) {
+      return cached.branch;
+    }
+
     try {
       const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', {
         cwd,
         timeout: 3000,
       });
-      return stdout.trim() || undefined;
+      const branch = stdout.trim() || undefined;
+      this.branchCache.set(cwd, { branch, ts: Date.now() });
+      return branch;
     } catch {
+      this.branchCache.set(cwd, { branch: undefined, ts: Date.now() });
       return undefined;
     }
   }
