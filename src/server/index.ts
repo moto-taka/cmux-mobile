@@ -7,7 +7,6 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
-import http from 'node:http';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,14 +21,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     ttydBasePort: config.ttydBasePort ?? 9001,
   };
 
-  // Initialize components
   const cmux = new CmuxSocketClient({ socketPath: fullConfig.socketPath });
   const ttyd = new TtydManager(fullConfig.ttydBasePort);
-
-  // Connected clients
   const clients = new Set<any>();
-
-  // Current workspace state
   let workspaces: Workspace[] = [];
 
   // ─── Fastify Setup ───
@@ -42,7 +36,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     prefix: '/',
   });
 
-  // ─── Broadcast helper ───
+  // ─── Broadcast ───
 
   function broadcast(message: ServerMessage) {
     const data = JSON.stringify(message);
@@ -53,18 +47,16 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     }
   }
 
-  // ─── WebSocket endpoint ───
+  // ─── WebSocket (control channel) ───
 
   fastify.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, (socket, _req) => {
       clients.add(socket);
 
-      // Send current state on connect
-      const connectMsg: ServerMessage = {
+      socket.send(JSON.stringify({
         type: 'connected',
         data: { port: fullConfig.port, ttydBasePort: fullConfig.ttydBasePort },
-      };
-      socket.send(JSON.stringify(connectMsg));
+      }));
 
       if (workspaces.length > 0) {
         socket.send(JSON.stringify({ type: 'workspaces', data: workspaces }));
@@ -81,55 +73,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
       socket.on('close', () => {
         clients.delete(socket);
-      });
-    });
-  });
-
-  // ─── ttyd WebSocket proxy ───
-  // Proxy WebSocket connections from /terminal/:workspaceId/ws to ttyd's WS
-  fastify.register(async function (fastify) {
-    fastify.get('/terminal/:workspaceId/ws', { websocket: true }, async (socket, req) => {
-      const { workspaceId } = req.params as { workspaceId: string };
-      const info = ttyd.getInfo(workspaceId);
-      if (!info) {
-        socket.close(404, 'Workspace not found');
-        return;
-      }
-
-      // Connect to ttyd's WebSocket
-      const ttydWsUrl = `ws://127.0.0.1:${info.port}/ws`;
-      const { default: WebSocket } = await import('ws');
-      const ttydSocket = new WebSocket(ttydWsUrl);
-
-      // Bidirectional proxy
-      ttydSocket.on('open', () => {
-        socket.on('message', (msg: any) => {
-          if (ttydSocket.readyState === 1) {
-            ttydSocket.send(msg);
-          }
-        });
-      });
-
-      ttydSocket.on('message', (msg: any) => {
-        if (socket.readyState === 1) {
-          socket.send(msg);
-        }
-      });
-
-      ttydSocket.on('close', (code: number, reason: Buffer) => {
-        if (socket.readyState === 1) {
-          socket.close(code, reason);
-        }
-      });
-
-      socket.on('close', () => {
-        if (ttydSocket.readyState === 1) {
-          ttydSocket.close();
-        }
-      });
-
-      ttydSocket.on('error', () => {
-        socket.close(1011, 'ttyd connection failed');
       });
     });
   });
@@ -169,15 +112,12 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   async function refreshWorkspaces() {
     try {
-      // listWorkspaces already fetches surfaces in cmux-socket.ts
       const wsList: Workspace[] = await cmux.listWorkspaces() as Workspace[];
 
-      // Sync ttyd processes
       await ttyd.syncWorkspaces(
         wsList.map((w: Workspace) => ({ id: w.id, cwd: w.cwd, name: w.name }))
       );
 
-      // Enrich with ttyd port info
       workspaces = wsList.map((w: Workspace) => {
         const info = ttyd.getInfo(w.id);
         return { ...w, ttydPort: info?.port };
@@ -185,17 +125,16 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
       broadcast({ type: 'workspaces', data: workspaces });
     } catch {
-      // cmux not available — that's ok, will retry
+      // cmux not available — will retry on next poll
     }
   }
 
-  // Listen for cmux workspace changes (pushed from polling in cmux-socket.ts)
+  // Listen for cmux polling updates
   cmux.on('workspace_changed', (wsList: unknown) => {
     const list = (wsList as Workspace[]) ?? [];
     workspaces = list;
     broadcast({ type: 'workspaces', data: workspaces });
 
-    // Sync ttyd
     ttyd.syncWorkspaces(
       list.map((w) => ({ id: w.id, cwd: w.cwd, name: w.name }))
     ).catch(() => {});
@@ -203,96 +142,17 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── REST API ───
 
-  fastify.get('/api/workspaces', async () => {
-    return workspaces;
-  });
+  fastify.get('/api/workspaces', async () => workspaces);
 
   fastify.post('/api/workspaces/:id/select', async (req) => {
-    const { id } = req.params as { id: string };
-    await cmux.selectWorkspace(id);
+    await cmux.selectWorkspace((req.params as { id: string }).id);
     return { ok: true };
   });
 
   fastify.post('/api/surfaces/:id/focus', async (req) => {
-    const { id } = req.params as { id: string };
-    await cmux.focusSurface(id);
+    await cmux.focusSurface((req.params as { id: string }).id);
     return { ok: true };
   });
-
-  // Terminal proxy — proxy HTTP and WS to ttyd process
-  // All requests go through port 3456 so mobile browsers don't need to access other ports
-  fastify.all('/terminal/:workspaceId/*', async (req, reply) => {
-    const { workspaceId } = req.params as { workspaceId: string };
-    const wildcard = (req.params as any)['*'] || '';
-    const info = ttyd.getInfo(workspaceId);
-    if (!info) {
-      reply.code(404).send({ error: 'Workspace terminal not found' });
-      return;
-    }
-
-    const targetUrl = `http://127.0.0.1:${info.port}/${wildcard}`;
-    proxyRequest(req, reply, targetUrl);
-  });
-
-  // Terminal root endpoint
-  fastify.get('/terminal/:workspaceId', async (req, reply) => {
-    const { workspaceId } = req.params as { workspaceId: string };
-    const info = ttyd.getInfo(workspaceId);
-    if (!info) {
-      reply.code(404).send({ error: 'Workspace terminal not found' });
-      return;
-    }
-    proxyRequest(req, reply, `http://127.0.0.1:${info.port}/`);
-  });
-
-  // ─── HTTP Proxy helper ───
-
-  function proxyRequest(req: any, reply: any, targetUrl: string) {
-    const parsedUrl = new URL(targetUrl);
-
-    const proxyHeaders: Record<string, string> = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === 'string' && !['host', 'connection'].includes(key.toLowerCase())) {
-        proxyHeaders[key] = value;
-      }
-    }
-    proxyHeaders['host'] = `127.0.0.1:${parsedUrl.port}`;
-
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: parseInt(parsedUrl.port),
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: req.method,
-      headers: proxyHeaders,
-    };
-
-    const proxyReq = http.request(options, (proxyRes) => {
-      const headers: Record<string, string> = {};
-      for (const [key, value] of Object.entries(proxyRes.headers)) {
-        if (typeof value === 'string') {
-          // Rewrite ttyd's WebSocket URL to go through our proxy
-          if (key.toLowerCase() === 'set-cookie' && value.includes('port=')) {
-            continue;
-          }
-          headers[key] = value;
-        }
-      }
-      // Add CORS headers for iframe access
-      headers['x-proxy-target'] = targetUrl;
-      reply.code(proxyRes.statusCode ?? 200);
-      reply.headers(headers);
-      proxyRes.pipe(reply.raw);
-    });
-
-    proxyReq.on('error', (err) => {
-      reply.code(502).send({ error: `Proxy error: ${err.message}` });
-    });
-
-    if (req.body) {
-      proxyReq.write(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
-    }
-    proxyReq.end();
-  }
 
   // SPA fallback
   fastify.setNotFoundHandler((_req, reply) => {
@@ -305,10 +165,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   console.log(`   Socket: ${fullConfig.socketPath}`);
   console.log(`   Port:   ${fullConfig.port}`);
 
-  // Start ttyd manager
   await ttyd.start();
 
-  // Connect to cmux
   try {
     await cmux.connect();
     console.log('   ✓ Connected to cmux socket');
@@ -318,10 +176,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     console.error('     Socket path:', fullConfig.socketPath);
   }
 
-  // Initial refresh
   await refreshWorkspaces();
 
-  // Show workspace summary
   if (workspaces.length > 0) {
     console.log(`   ✓ ${workspaces.length} workspaces found:`);
     for (const ws of workspaces) {
@@ -334,10 +190,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     console.log('   ⚠ No workspaces found');
   }
 
-  // Start HTTP server
   await fastify.listen({ port: fullConfig.port, host: fullConfig.host });
 
-  // Get network IPs for mobile access
+  // Show access URLs
   const nets = os.networkInterfaces();
   const ips: string[] = [];
   for (const iface of Object.values(nets)) {
