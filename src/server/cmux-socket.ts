@@ -138,24 +138,16 @@ export class CmuxSocketClient {
     };
     if (!result?.workspaces) return [];
 
-    // Map cmux response to our Workspace type
     const workspaces: Workspace[] = result.workspaces.map((w) => {
       const rawTitle = (w.title as string) || '';
-      // cmux uses spinner characters like ⠐⠏⠛ at the start of title when busy
       const spinnerMatch = rawTitle.match(/^([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋⠛⠞⠟⠐⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿✳])\s*/);
       let status: string | undefined;
       let displayName = rawTitle;
 
       if (spinnerMatch) {
-        // Spinner character indicates active process
-        if (rawTitle.includes('Claude Code')) {
-          status = 'running';
-        } else {
-          status = 'running';
-        }
+        status = 'running';
         displayName = rawTitle.replace(spinnerMatch[0], '').trim();
       } else if (rawTitle.startsWith('~/') || rawTitle.startsWith('/')) {
-        // Just a directory path = idle
         status = 'idle';
       } else if (rawTitle.startsWith('✳')) {
         status = 'idle';
@@ -166,7 +158,7 @@ export class CmuxSocketClient {
         id: w.id as string,
         name: displayName || (w.id as string),
         cwd: (w.current_directory as string) || (w.cwd as string) || '',
-        git_branch: undefined, // Will be enriched separately
+        git_branch: undefined,
         status,
         progress: undefined,
         latest_log: undefined,
@@ -186,7 +178,6 @@ export class CmuxSocketClient {
           ...ws,
           surfaces,
           git_branch: gitBranch,
-          // Enrich with sidebar state if available, otherwise keep spinner-based status
           status: (sidebarData?.status as string) || ws.status,
           progress: (sidebarData?.progress as number) ?? ws.progress,
           latest_log: (sidebarData?.latest_log as string) || ws.latest_log,
@@ -195,18 +186,6 @@ export class CmuxSocketClient {
     );
 
     return enriched;
-  }
-
-  private async getGitBranch(cwd: string): Promise<string | undefined> {
-    try {
-      const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', {
-        cwd,
-        timeout: 3000,
-      });
-      return stdout.trim() || undefined;
-    } catch {
-      return undefined;
-    }
   }
 
   async selectWorkspace(id: string): Promise<void> {
@@ -238,56 +217,18 @@ export class CmuxSocketClient {
     await this.request('surface.send_key', { surface_id: surfaceId, key });
   }
 
-  // ─── Additional API methods ───
+  // ─── Private helpers ───
 
-  async createWorkspace(name: string, cwd?: string): Promise<void> {
-    const params: Record<string, string> = { name };
-    if (cwd) params.cwd = cwd;
-    await this.request('workspace.create', params);
-  }
-
-  async closeWorkspace(id: string): Promise<void> {
-    await this.request('workspace.close', { workspace_id: id });
-  }
-
-  async splitWorkspace(workspaceId: string): Promise<void> {
-    await this.request('surface.split', { workspace_id: workspaceId });
-  }
-
-  async createNotification(workspaceId: string, message: string, level: string): Promise<void> {
-    await this.request('notification.create', { workspace_id: workspaceId, message, level });
-  }
-
-  async listNotifications(): Promise<unknown> {
-    return this.request('notification.list');
-  }
-
-  async clearNotifications(workspaceId: string): Promise<void> {
-    await this.request('notification.clear', { workspace_id: workspaceId });
-  }
-
-  async systemPing(): Promise<unknown> {
-    return this.request('system.ping');
-  }
-
-  async systemCapabilities(): Promise<unknown> {
-    return this.request('system.capabilities');
-  }
-
-  async setSidebarStatus(workspaceId: string, status: string): Promise<void> {
-    await this.request('sidebar.set_status', { workspace_id: workspaceId, status });
-  }
-
-  async setSidebarProgress(workspaceId: string, progress: number): Promise<void> {
-    await this.request('sidebar.set_progress', { workspace_id: workspaceId, progress });
-  }
-
-  async sidebarLog(workspaceId: string, message: string): Promise<void> {
-    await this.request('sidebar.log', { workspace_id: workspaceId, message });
-  }
-
-  async sidebarState(workspaceId: string): Promise<unknown> {
-    return this.request('sidebar.sidebar_state', { workspace_id: workspaceId });
+  private async getGitBranch(cwd: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', {
+        cwd,
+        timeout: 3000,
+      });
+      return stdout.trim() || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async getSidebarState(workspaceId: string): Promise<Record<string, unknown> | null> {
@@ -330,7 +271,6 @@ export class CmuxSocketClient {
   private handleData(chunk: string): void {
     this.buffer += chunk;
 
-    // Messages are newline-delimited JSON
     let newlineIdx: number;
     while ((newlineIdx = this.buffer.indexOf('\n')) !== -1) {
       const line = this.buffer.slice(0, newlineIdx).trim();
@@ -341,10 +281,8 @@ export class CmuxSocketClient {
       try {
         const payload = JSON.parse(line);
         if (isJSONRPCRequest(payload) && payload.id === undefined) {
-          // This is a notification (no id field or id is null)
           this.handleNotification(payload as JSONRPCRequest & { method: string });
         } else {
-          // Response to a previous request
           this.rpcClient.receive(payload);
         }
       } catch {
@@ -354,10 +292,7 @@ export class CmuxSocketClient {
   }
 
   private handleNotification(notification: JSONRPCRequest & { method: string }): void {
-    const method = notification.method;
-
-    // Map cmux notification methods to client events
-    if (method === 'on_workspace_changed') {
+    if (notification.method === 'on_workspace_changed') {
       this.emit('workspace_changed', notification.params);
     }
   }
@@ -429,7 +364,7 @@ export class CmuxSocketClient {
 
   private startPolling(): void {
     this.stopPolling();
-    this.pollWorkspaces(); // Initial fetch
+    this.pollWorkspaces();
 
     this.pollTimer = setInterval(() => {
       this.pollWorkspaces();

@@ -41,8 +41,13 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   function broadcast(message: ServerMessage) {
     const data = JSON.stringify(message);
     for (const client of clients) {
-      if ((client as any).readyState === 1) {
-        client.send(data);
+      try {
+        if ((client as any).readyState === 1) {
+          client.send(data);
+        }
+      } catch {
+        // Individual client send failure — remove dead client
+        clients.delete(client);
       }
     }
   }
@@ -250,8 +255,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   return fastify;
 }
 
-// Direct execution
+// Direct execution support (for npx tsx src/server/index.ts start)
 const args = process.argv.slice(2);
-if (args[0] === 'start') {
+if (args[0] === 'start' && process.argv[1]?.includes('index.ts')) {
   createServer().catch(console.error);
 }
