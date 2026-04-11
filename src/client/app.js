@@ -235,11 +235,16 @@
 
   function updateTtydFrame() {
     if (!currentWorkspaceId) return;
-    // Use the server's terminal proxy endpoint
-    const url = '/terminal/' + currentWorkspaceId;
-    const fullUrl = location.protocol + '//' + location.host + url;
-    if (ttydFrame.src !== fullUrl) {
-      ttydFrame.src = url;
+    const wsObj = getWorkspace(currentWorkspaceId);
+    if (!wsObj) return;
+
+    // Direct ttyd access using the ttyd port (same host, different port)
+    // This works on local network and Tailscale
+    if (wsObj.ttydPort) {
+      const url = 'http://' + location.hostname + ':' + wsObj.ttydPort + '/';
+      if (ttydFrame.src !== url) {
+        ttydFrame.src = url;
+      }
     }
   }
 

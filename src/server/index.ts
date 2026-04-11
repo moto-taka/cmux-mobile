@@ -171,13 +171,19 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     try {
       // listWorkspaces already fetches surfaces in cmux-socket.ts
       const wsList: Workspace[] = await cmux.listWorkspaces() as Workspace[];
-      workspaces = wsList;
-      broadcast({ type: 'workspaces', data: workspaces });
 
       // Sync ttyd processes
       await ttyd.syncWorkspaces(
         wsList.map((w: Workspace) => ({ id: w.id, cwd: w.cwd, name: w.name }))
       );
+
+      // Enrich with ttyd port info
+      workspaces = wsList.map((w: Workspace) => {
+        const info = ttyd.getInfo(w.id);
+        return { ...w, ttydPort: info?.port };
+      });
+
+      broadcast({ type: 'workspaces', data: workspaces });
     } catch {
       // cmux not available — that's ok, will retry
     }

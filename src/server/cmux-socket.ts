@@ -1,7 +1,11 @@
 import net from 'node:net';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import { JSONRPCClient, isJSONRPCRequest } from 'json-rpc-2.0';
 import type { JSONRPCRequest } from 'json-rpc-2.0';
 import type { Workspace, Surface } from '../shared/types.js';
+
+const execAsync = promisify(exec);
 
 type EventCallback = (...args: unknown[]) => void;
 
@@ -135,30 +139,65 @@ export class CmuxSocketClient {
     if (!result?.workspaces) return [];
 
     // Map cmux response to our Workspace type
-    const workspaces: Workspace[] = result.workspaces.map((w) => ({
-      id: w.id as string,
-      name: (w.title as string) || (w.name as string) || (w.id as string),
-      cwd: (w.current_directory as string) || (w.cwd as string) || '',
-      git_branch: (w.git_branch as string) || undefined,
-      status: (w.status as string) || undefined,
-      progress: (w.progress as number) || undefined,
-      latest_log: (w.latest_log as string) || undefined,
-      surfaces: [],
-    }));
+    const workspaces: Workspace[] = result.workspaces.map((w) => {
+      const rawTitle = (w.title as string) || '';
+      // cmux uses spinner characters like ⠐⠏⠛ at the start of title when busy
+      const spinnerMatch = rawTitle.match(/^([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋⠛⠞⠟⠐⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿✳])\s*/);
+      let status: string | undefined;
+      let displayName = rawTitle;
+
+      if (spinnerMatch) {
+        // Spinner character indicates active process
+        if (rawTitle.includes('Claude Code')) {
+          status = 'running';
+        } else {
+          status = 'running';
+        }
+        displayName = rawTitle.replace(spinnerMatch[0], '').trim();
+      } else if (rawTitle.startsWith('~/') || rawTitle.startsWith('/')) {
+        // Just a directory path = idle
+        status = 'idle';
+      } else if (rawTitle.startsWith('✳')) {
+        status = 'idle';
+        displayName = rawTitle.replace(/^✳\s*/, '').trim();
+      }
+
+      return {
+        id: w.id as string,
+        name: displayName || (w.id as string),
+        cwd: (w.current_directory as string) || (w.cwd as string) || '',
+        git_branch: undefined, // Will be enriched separately
+        status,
+        progress: undefined,
+        latest_log: undefined,
+        surfaces: [],
+      };
+    });
 
     // Fetch surfaces for each workspace in parallel
     const enriched = await Promise.all(
       workspaces.map(async (ws) => {
-        try {
-          const surfaces = await this.listSurfaces(ws.id);
-          return { ...ws, surfaces };
-        } catch {
-          return { ...ws, surfaces: [] };
-        }
+        const [surfaces, gitBranch] = await Promise.all([
+          this.listSurfaces(ws.id).catch(() => [] as Surface[]),
+          this.getGitBranch(ws.cwd),
+        ]);
+        return { ...ws, surfaces, git_branch: gitBranch };
       }),
     );
 
     return enriched;
+  }
+
+  private async getGitBranch(cwd: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', {
+        cwd,
+        timeout: 3000,
+      });
+      return stdout.trim() || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async selectWorkspace(id: string): Promise<void> {

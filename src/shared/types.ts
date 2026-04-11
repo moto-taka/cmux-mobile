@@ -12,6 +12,7 @@ export interface Workspace {
   status?: string;
   progress?: number;
   latest_log?: string;
+  ttydPort?: number;
   surfaces: Surface[];
 }
 
