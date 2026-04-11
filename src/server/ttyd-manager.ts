@@ -6,6 +6,7 @@ import * as net from 'node:net';
 const execAsync = promisify(exec);
 
 const DEFAULT_BASE_PORT = 9001;
+const MAX_PORT = 65535;
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
 
 interface TtydProcessInfo {
@@ -212,6 +213,10 @@ export class TtydManager {
   private findAvailablePort(): Promise<number> {
     return new Promise((resolve, reject) => {
       const tryPort = () => {
+        if (this.nextPort > MAX_PORT) {
+          reject(new Error('No available ports (exhausted range)'));
+          return;
+        }
         const port = this.nextPort++;
         const server = net.createServer();
         server.on('error', () => {

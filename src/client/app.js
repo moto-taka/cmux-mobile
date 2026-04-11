@@ -12,7 +12,8 @@
   let infoPanelOpen = false;
   let ws = null;
   let reconnectTimer = null;
-  let ttydBasePort = 0;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 50;
 
   // ─── DOM refs ───
 
@@ -71,6 +72,7 @@
     ws.onopen = () => {
       console.log('[cmux] WebSocket connected');
       setConnStatus('connected');
+      reconnectAttempts = 0;
     };
 
     ws.onmessage = (event) => {
@@ -83,7 +85,7 @@
     };
 
     ws.onclose = () => {
-      console.log('[cmux] WebSocket closed, reconnecting in 3s...');
+      console.log('[cmux] WebSocket closed, reconnecting...');
       setConnStatus('');
       if (workspaces.length === 0) showError();
       scheduleReconnect();
@@ -94,12 +96,26 @@
     };
   }
 
+  function getReconnectDelay() {
+    // Exponential backoff: 3s, 6s, 12s, ... max 30s
+    const base = 3000;
+    const delay = Math.min(base * Math.pow(1.5, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    return delay;
+  }
+
   function scheduleReconnect() {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      console.log('[cmux] Max reconnect attempts reached');
+      showError();
+      return;
+    }
     if (reconnectTimer) return;
+    const delay = getReconnectDelay();
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectWS();
-    }, 3000);
+    }, delay);
   }
 
   function clearReconnectTimer() {
@@ -107,6 +123,7 @@
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    reconnectAttempts = 0;
   }
 
   function send(msg) {
@@ -120,8 +137,7 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case 'connected':
-        ttydBasePort = msg.data.ttydBasePort || 0;
-        console.log('[cmux] Connected, ttydBasePort:', ttydBasePort);
+        console.log('[cmux] Connected to server');
         break;
       case 'workspaces':
         workspaces = msg.data || [];
@@ -325,6 +341,11 @@
     val.className = 'info-value ws-status-text ' + statusClass;
     infoContent.appendChild(statusRow);
 
+    // Surfaces count
+    if (wsObj.surfaces && wsObj.surfaces.length > 0) {
+      infoContent.appendChild(createInfoRow('surfaces', String(wsObj.surfaces.length)));
+    }
+
     // Progress bar
     if (typeof wsObj.progress === 'number' && wsObj.progress > 0) {
       const progressRow = document.createElement('div');
@@ -419,26 +440,44 @@
     }
   }
 
-  // ─── Touch: Swipe to close sidebar ───
+  // ─── Touch: Swipe gestures ───
 
   let touchStartX = 0;
   let touchStartY = 0;
+  let touchStartTime = 0;
 
   function onTouchStart(e) {
     const touch = e.touches[0];
     touchStartX = touch.clientX;
     touchStartY = touch.clientY;
+    touchStartTime = Date.now();
   }
 
   function onTouchEnd(e) {
     const touch = e.changedTouches[0];
     const dx = touch.clientX - touchStartX;
     const dy = Math.abs(touch.clientY - touchStartY);
+    const dt = Date.now() - touchStartTime;
 
-    if (dy > Math.abs(dx)) return;
+    // Ignore slow swipes and vertical scrolls
+    if (dy > Math.abs(dx) || dt > 500) return;
 
     if (sidebarOpen && dx < -50) {
       closeSidebar();
+    }
+
+    // Swipe down on info panel to close
+    if (infoPanelOpen && dy < Math.abs(dx) === false && (touch.clientY - touchStartY) > 50) {
+      closeInfoPanel();
+    }
+  }
+
+  // ─── Visibility change: reconnect on focus ───
+
+  function onVisibilityChange() {
+    if (document.visibilityState === 'visible' && (!ws || ws.readyState !== WebSocket.OPEN)) {
+      clearReconnectTimer();
+      connectWS();
     }
   }
 
@@ -453,6 +492,8 @@
 
   document.addEventListener('touchstart', onTouchStart, { passive: true });
   document.addEventListener('touchend', onTouchEnd, { passive: true });
+
+  document.addEventListener('visibilitychange', onVisibilityChange);
 
   retryBtn.addEventListener('click', () => {
     clearReconnectTimer();

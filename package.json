@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "tsx src/server/index.ts start",
-    "build": "tsup && cp -r src/client dist/client && cp -r src/shared dist/shared",
+    "build": "tsup && rm -rf dist/client dist/shared && cp -r src/client dist/client && cp -r src/shared dist/shared",
     "start": "node dist/server/index.mjs start",
     "typecheck": "tsc --noEmit"
   },

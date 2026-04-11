@@ -218,16 +218,34 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── Graceful shutdown ───
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('\nShutting down...');
-    cmux.disconnect();
-    await ttyd.stop();
-    await fastify.close();
+    try {
+      cmux.disconnect();
+      await ttyd.stop();
+      await fastify.close();
+    } catch (err) {
+      console.error('Error during shutdown:', err);
+    }
     process.exit(0);
   };
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // Prevent unhandled promise rejections from crashing the process
+  process.on('unhandledRejection', (reason) => {
+    console.error('[cmux-mobile] Unhandled rejection:', reason);
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error('[cmux-mobile] Uncaught exception:', err);
+    // Attempt graceful shutdown on fatal errors
+    shutdown();
+  });
 
   return fastify;
 }
