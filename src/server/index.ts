@@ -130,14 +130,20 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   }
 
   // Listen for cmux polling updates
-  cmux.on('workspace_changed', (wsList: unknown) => {
+  cmux.on('workspace_changed', async (wsList: unknown) => {
     const list = (wsList as Workspace[]) ?? [];
-    workspaces = list;
-    broadcast({ type: 'workspaces', data: workspaces });
 
-    ttyd.syncWorkspaces(
+    // Sync ttyd first, then enrich with port info
+    await ttyd.syncWorkspaces(
       list.map((w) => ({ id: w.id, cwd: w.cwd, name: w.name }))
     ).catch(() => {});
+
+    workspaces = list.map((w: Workspace) => {
+      const info = ttyd.getInfo(w.id);
+      return { ...w, ttydPort: info?.port };
+    });
+
+    broadcast({ type: 'workspaces', data: workspaces });
   });
 
   // ─── REST API ───

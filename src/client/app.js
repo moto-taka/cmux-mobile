@@ -230,7 +230,9 @@
 
       const name = document.createElement('span');
       name.className = 'ws-name';
-      name.textContent = wsObj.name;
+      // Truncate long names, show tooltip with full name
+      name.textContent = wsObj.name.length > 28 ? wsObj.name.slice(0, 26) + '...' : wsObj.name;
+      name.title = wsObj.name;
 
       header.appendChild(dot);
       header.appendChild(name);
@@ -241,6 +243,13 @@
         branch.className = 'ws-branch';
         branch.textContent = wsObj.git_branch;
         li.appendChild(branch);
+      } else if (wsObj.cwd) {
+        // Show directory basename as fallback when no git branch
+        const cwd = document.createElement('span');
+        cwd.className = 'ws-branch';
+        const parts = wsObj.cwd.split('/');
+        cwd.textContent = parts[parts.length - 1] || wsObj.cwd;
+        li.appendChild(cwd);
       }
 
       if (wsObj.status) {
