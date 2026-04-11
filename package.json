@@ -6,9 +6,9 @@
     "cmux-mobile": "./bin/cmux-mobile.js"
   },
   "scripts": {
-    "dev": "tsx watch src/server/index.ts",
-    "build": "tsup",
-    "start": "node dist/server/index.js",
+    "dev": "tsx src/server/index.ts start",
+    "build": "tsup && cp -r src/client dist/client && cp -r src/shared dist/shared",
+    "start": "node dist/server/index.mjs start",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

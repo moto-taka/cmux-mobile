@@ -1,6 +1,7 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { exec } from 'node:child_process';
+import * as net from 'node:net';
 
 const execAsync = promisify(exec);
 
@@ -128,7 +129,7 @@ export class TtydManager {
   }
 
   private async spawnTtyd(workspace: WorkspaceInput): Promise<void> {
-    const port = this.nextPort++;
+    const port = await this.findAvailablePort();
 
     const proc = spawn(
       'ttyd',
@@ -209,6 +210,23 @@ export class TtydManager {
     } catch {
       return false;
     }
+  }
+
+  private findAvailablePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const tryPort = () => {
+        const port = this.nextPort++;
+        const server = net.createServer();
+        server.on('error', () => {
+          // Port in use, try next
+          tryPort();
+        });
+        server.listen(port, '127.0.0.1', () => {
+          server.close(() => resolve(port));
+        });
+      };
+      tryPort();
+    });
   }
 
   private startHealthCheck(): void {

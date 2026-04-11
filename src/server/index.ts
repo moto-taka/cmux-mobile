@@ -7,6 +7,7 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
+import http from 'node:http';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -80,6 +81,55 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
       socket.on('close', () => {
         clients.delete(socket);
+      });
+    });
+  });
+
+  // ─── ttyd WebSocket proxy ───
+  // Proxy WebSocket connections from /terminal/:workspaceId/ws to ttyd's WS
+  fastify.register(async function (fastify) {
+    fastify.get('/terminal/:workspaceId/ws', { websocket: true }, async (socket, req) => {
+      const { workspaceId } = req.params as { workspaceId: string };
+      const info = ttyd.getInfo(workspaceId);
+      if (!info) {
+        socket.close(404, 'Workspace not found');
+        return;
+      }
+
+      // Connect to ttyd's WebSocket
+      const ttydWsUrl = `ws://127.0.0.1:${info.port}/ws`;
+      const { default: WebSocket } = await import('ws');
+      const ttydSocket = new WebSocket(ttydWsUrl);
+
+      // Bidirectional proxy
+      ttydSocket.on('open', () => {
+        socket.on('message', (msg: any) => {
+          if (ttydSocket.readyState === 1) {
+            ttydSocket.send(msg);
+          }
+        });
+      });
+
+      ttydSocket.on('message', (msg: any) => {
+        if (socket.readyState === 1) {
+          socket.send(msg);
+        }
+      });
+
+      ttydSocket.on('close', (code: number, reason: Buffer) => {
+        if (socket.readyState === 1) {
+          socket.close(code, reason);
+        }
+      });
+
+      socket.on('close', () => {
+        if (ttydSocket.readyState === 1) {
+          ttydSocket.close();
+        }
+      });
+
+      ttydSocket.on('error', () => {
+        socket.close(1011, 'ttyd connection failed');
       });
     });
   });
@@ -163,17 +213,80 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     return { ok: true };
   });
 
-  // Terminal proxy — redirect to ttyd port
+  // Terminal proxy — proxy HTTP and WS to ttyd process
+  // All requests go through port 3456 so mobile browsers don't need to access other ports
+  fastify.all('/terminal/:workspaceId/*', async (req, reply) => {
+    const { workspaceId } = req.params as { workspaceId: string };
+    const wildcard = (req.params as any)['*'] || '';
+    const info = ttyd.getInfo(workspaceId);
+    if (!info) {
+      reply.code(404).send({ error: 'Workspace terminal not found' });
+      return;
+    }
+
+    const targetUrl = `http://127.0.0.1:${info.port}/${wildcard}`;
+    proxyRequest(req, reply, targetUrl);
+  });
+
+  // Terminal root endpoint
   fastify.get('/terminal/:workspaceId', async (req, reply) => {
     const { workspaceId } = req.params as { workspaceId: string };
     const info = ttyd.getInfo(workspaceId);
-    if (info) {
-      const host = fullConfig.host === '0.0.0.0' ? req.hostname : fullConfig.host;
-      reply.redirect(`http://${host}:${info.port}/`);
-    } else {
+    if (!info) {
       reply.code(404).send({ error: 'Workspace terminal not found' });
+      return;
     }
+    proxyRequest(req, reply, `http://127.0.0.1:${info.port}/`);
   });
+
+  // ─── HTTP Proxy helper ───
+
+  function proxyRequest(req: any, reply: any, targetUrl: string) {
+    const parsedUrl = new URL(targetUrl);
+
+    const proxyHeaders: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === 'string' && !['host', 'connection'].includes(key.toLowerCase())) {
+        proxyHeaders[key] = value;
+      }
+    }
+    proxyHeaders['host'] = `127.0.0.1:${parsedUrl.port}`;
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parseInt(parsedUrl.port),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: req.method,
+      headers: proxyHeaders,
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      const headers: Record<string, string> = {};
+      for (const [key, value] of Object.entries(proxyRes.headers)) {
+        if (typeof value === 'string') {
+          // Rewrite ttyd's WebSocket URL to go through our proxy
+          if (key.toLowerCase() === 'set-cookie' && value.includes('port=')) {
+            continue;
+          }
+          headers[key] = value;
+        }
+      }
+      // Add CORS headers for iframe access
+      headers['x-proxy-target'] = targetUrl;
+      reply.code(proxyRes.statusCode ?? 200);
+      reply.headers(headers);
+      proxyRes.pipe(reply.raw);
+    });
+
+    proxyReq.on('error', (err) => {
+      reply.code(502).send({ error: `Proxy error: ${err.message}` });
+    });
+
+    if (req.body) {
+      proxyReq.write(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
+    }
+    proxyReq.end();
+  }
 
   // SPA fallback
   fastify.setNotFoundHandler((_req, reply) => {

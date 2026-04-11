@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // cmux-mobile CLI entry point
-import { createServer } from '../dist/server/index.js';
+import { createServer } from '../dist/server/index.mjs';
 
 const args = process.argv.slice(2);
 
