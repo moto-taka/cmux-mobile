@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1b26">
+  <title>cmux</title>
+  <link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+  <!-- Overlay for sidebar backdrop -->
+  <div id="overlay" class="overlay" aria-hidden="true"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar" class="sidebar" aria-label="Workspaces">
+    <div class="sidebar-header">
+      <span class="sidebar-title">Workspaces</span>
+      <button id="sidebar-close" class="icon-btn" aria-label="Close sidebar">&times;</button>
+    </div>
+    <ul id="workspace-list" class="workspace-list"></ul>
+  </aside>
+
+  <!-- Main layout -->
+  <div class="main-layout">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <button id="menu-btn" class="icon-btn" aria-label="Open menu">&#9776;</button>
+        <span id="workspace-name" class="workspace-name">cmux</span>
+      </div>
+      <div class="header-right">
+        <button id="info-btn" class="icon-btn" aria-label="Toggle info panel">&#8505;</button>
+      </div>
+    </header>
+
+    <!-- Surface tabs -->
+    <nav id="surface-tabs" class="surface-tabs" aria-label="Surfaces"></nav>
+
+    <!-- Terminal area -->
+    <div class="terminal-area">
+      <iframe id="ttyd-frame" class="ttyd-frame" src="about:blank" allow="clipboard-read; clipboard-write"></iframe>
+    </div>
+  </div>
+
+  <!-- Info panel -->
+  <div id="info-panel" class="info-panel" aria-label="Workspace info">
+    <div class="info-panel-header">
+      <span class="info-panel-title">Workspace Info</span>
+      <button id="info-close" class="icon-btn" aria-label="Close info panel">&times;</button>
+    </div>
+    <div id="info-content" class="info-content">
+      <p class="info-empty">Select a workspace to view details.</p>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
