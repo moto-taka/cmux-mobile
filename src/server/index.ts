@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
 import http from 'http';
+import { WebSocket as Ws } from 'ws';
 import proxy from '@fastify/http-proxy';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
@@ -229,15 +230,69 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     if (registeredProxies.has(ttydPort)) return;
     registeredProxies.add(ttydPort);
 
+    // HTTP proxy only — WebSocket handled separately to avoid ERR_HTTP_SOCKET_ASSIGNED
     fastify.register(proxy, {
       upstream: `http://localhost:${ttydPort}`,
       prefix: `/ttyd/${ttydPort}`,
-      websocket: true,
+      websocket: false,
       rewritePrefix: '/',
+      async preHandler(req, _reply) {
+        // Store ttydPort for the onSend hook
+        (req as any).__ttydPort = ttydPort;
+      },
+    });
+
+    // Inject WebSocket override into proxied ttyd HTML
+    fastify.addHook('onSend', async (req, reply, payload) => {
+      const port = (req as any).__ttydPort;
+      if (!port) return payload;
+      const ct = reply.getHeader('content-type') as string;
+      if (typeof ct !== 'string' || !ct.includes('text/html')) return payload;
+
+      const inject = `<script>window.__ttydPort='${port}';(function(){var O=window.WebSocket;window.WebSocket=function(u,p){if(/\\/ws/.test(u)){u=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ttyd-ws/'+window.__ttydPort}return new O(u,p)}})()</script>`;
+      const body = typeof payload === 'string' ? payload : String(payload);
+      return body.replace('<head>', '<head>' + inject);
     });
 
     console.log(`   [proxy] /ttyd/${ttydPort} → localhost:${ttydPort}`);
   }
+
+  // WebSocket bridge: /ttyd-ws/:port → ws://localhost:port/ws
+  // ttyd's JS creates WebSocket at /ws, but we need to route it through our server.
+  // The client injects window.__ttydPort and overrides WebSocket to use this path.
+  fastify.register(async function (fastify) {
+    fastify.get('/ttyd-ws/:port', { websocket: true }, (socket, req) => {
+      const ttydPort = parseInt((req.params as any).port, 10);
+      if (isNaN(ttydPort) || ttydPort < 1) {
+        socket.close();
+        return;
+      }
+
+      const target = new Ws(`ws://localhost:${ttydPort}/ws`);
+
+      target.on('open', () => {
+        socket.on('message', (raw: any) => {
+          if (target.readyState === 1) target.send(raw);
+        });
+        socket.on('close', () => {
+          if (target.readyState === 1) target.close();
+        });
+      });
+
+      target.on('message', (data: Buffer) => {
+        if (socket.readyState === 1) socket.send(data);
+      });
+
+      target.on('close', () => {
+        if (socket.readyState === 1) socket.close();
+      });
+
+      target.on('error', (err: Error) => {
+        console.error(`[ws-proxy] /ttyd-ws/${ttydPort} error:`, err.message);
+        if (socket.readyState === 1) socket.close();
+      });
+    });
+  });
 
   // ─── REST API ───
 
