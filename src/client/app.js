@@ -24,9 +24,22 @@
   let pinchStartDistance = 0;
   let pinchStartFontSize = 14;
 
+  // Scroll state
+  let scrollTouchId = null;
+  let scrollLastY = 0;
+  let scrollLastTime = 0;
+  let scrollVelocity = 0;
+  let scrollRAF = null;
+
   // Extra keys sticky state
   let ctrlActive = false;
   let altActive = false;
+
+  // Long-press selection state
+  let longPressTimer = null;
+  let longPressStartX = 0;
+  let longPressStartY = 0;
+  let isLongPressing = false;
 
   // ─── DOM refs ───
 
@@ -51,6 +64,20 @@
   const connStatus = $('#conn-status');
   const toastContainer = $('#toast-container');
   const extraKeysBar = $('#extra-keys-bar');
+
+  // ─── Helpers ───
+
+  function getLineHeight() {
+    if (term && term._core && term._core._renderService) {
+      try {
+        const h = term._core._renderService.dimensions.css.cell.height;
+        if (h && h > 0) return h;
+      } catch (_) { /* fall through */ }
+    }
+    // Approximate: fontSize * 1.2
+    const fs = (term && term.options.fontSize) ? term.options.fontSize : 14;
+    return fs * 1.2;
+  }
 
   // ─── Terminal (xterm.js) ───
 
@@ -115,6 +142,9 @@
 
     terminalContainer.addEventListener('touchstart', (e) => {
       if (e.touches.length !== 2) return;
+      // Cancel any ongoing momentum scroll when pinch starts
+      cancelScrollMomentum();
+      scrollTouchId = null;
       const t1 = e.touches[0];
       const t2 = e.touches[1];
       pinchStartDistance = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
@@ -140,7 +170,204 @@
       localStorage.setItem('cmux-font-size', String(term.options.fontSize));
     }, { passive: true });
 
+    // ── 1-finger scroll with momentum ──
+
+    terminalContainer.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+
+      cancelScrollMomentum();
+      const touch = e.touches[0];
+      scrollTouchId = touch.identifier;
+      scrollLastY = touch.clientY;
+      scrollLastTime = Date.now();
+      scrollVelocity = 0;
+
+      // Long-press detection for text selection
+      longPressStartX = touch.clientX;
+      longPressStartY = touch.clientY;
+      isLongPressing = false;
+      clearTimeout(longPressTimer);
+      longPressTimer = setTimeout(() => {
+        isLongPressing = true;
+        scrollTouchId = null; // cancel scroll
+        if (navigator.vibrate) navigator.vibrate(50);
+        // Get text from xterm buffer at the touch position
+        copyLineAtTouch(touch);
+      }, 500);
+    }, { passive: true });
+
+    terminalContainer.addEventListener('touchmove', (e) => {
+      // Only handle 1-finger scroll
+      if (e.touches.length !== 1) return;
+      if (scrollTouchId === null) return;
+
+      const touch = e.touches[0];
+      if (touch.identifier !== scrollTouchId) return;
+
+      // Cancel long-press if finger moved more than 10px
+      if (longPressTimer) {
+        const dx = touch.clientX - longPressStartX;
+        const dy = touch.clientY - longPressStartY;
+        if (Math.hypot(dx, dy) > 10) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+      }
+
+      const now = Date.now();
+      const dy = touch.clientY - scrollLastY;
+      const dt = now - scrollLastTime;
+
+      if (dt > 0) {
+        // pixels per millisecond
+        scrollVelocity = dy / dt;
+      }
+
+      // Convert pixel delta to line delta and scroll
+      const lineHeight = getLineHeight();
+      const lineDelta = Math.round(dy / lineHeight);
+      if (lineDelta !== 0) {
+        // Positive dy = finger moved down = scroll up in terminal (negative)
+        if (term.scrollLines) {
+          term.scrollLines(-lineDelta);
+        }
+        // Reset accumulator — only scroll full line increments
+        scrollLastY += lineDelta * lineHeight;
+      }
+
+      scrollLastTime = now;
+
+      // Prevent browser's native touch scrolling inside the terminal
+      e.preventDefault();
+    }, { passive: false });
+
+    terminalContainer.addEventListener('touchend', (e) => {
+      // Cancel long-press timer on touch end
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+      isLongPressing = false;
+
+      if (scrollTouchId === null) return;
+      const touch = e.changedTouches[0];
+      if (touch.identifier !== scrollTouchId) return;
+
+      scrollTouchId = null;
+
+      // Start momentum scroll if velocity is significant
+      if (Math.abs(scrollVelocity) > 0.01) {
+        startScrollMomentum(scrollVelocity);
+      }
+    }, { passive: true });
+
+    terminalContainer.addEventListener('touchcancel', () => {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+      isLongPressing = false;
+      scrollTouchId = null;
+      cancelScrollMomentum();
+    }, { passive: true });
+
     return term;
+  }
+
+  // ── Momentum scroll animation ──
+
+  // ── Long-press copy ──
+
+  function copyLineAtTouch(touch) {
+    if (!term) return;
+
+    // Try to get the line at the touch position from xterm buffer
+    let textToCopy = '';
+
+    // Method 1: Use xterm's built-in selection if available
+    if (term.hasSelection && term.hasSelection()) {
+      textToCopy = term.getSelection();
+    }
+
+    // Method 2: Extract the line from the buffer at the touch Y position
+    if (!textToCopy && term.buffer && term.buffer.active) {
+      const lineHeight = getLineHeight();
+      const termRect = terminalContainer.getBoundingClientRect();
+      const touchOffsetY = touch.clientY - termRect.top;
+      const row = Math.floor(touchOffsetY / lineHeight);
+
+      const bufferLine = term.buffer.active.getLine(row);
+      if (bufferLine) {
+        textToCopy = bufferLine.translateToString(true);
+      }
+    }
+
+    if (textToCopy && textToCopy.trim()) {
+      copyToClipboard(textToCopy.trim());
+      showToast('Copied: ' + (textToCopy.trim().length > 40 ? textToCopy.trim().substring(0, 40) + '...' : textToCopy.trim()), 'success');
+    } else {
+      showToast('No text to copy', '');
+    }
+  }
+
+  function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {
+        fallbackCopy(text);
+      });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (_) { /* ignore */ }
+    document.body.removeChild(ta);
+  }
+
+  function cancelScrollMomentum() {
+    if (scrollRAF !== null) {
+      cancelAnimationFrame(scrollRAF);
+      scrollRAF = null;
+    }
+  }
+
+  function startScrollMomentum(initialVelocity) {
+    // initialVelocity is in px/ms
+    const FRICTION = 0.95; // per-frame decay factor
+    const MIN_VELOCITY = 0.005; // px/ms — stop threshold
+    const FRAME_MS = 16; // ~60fps
+
+    let velocity = initialVelocity;
+    let lastFrameTime = performance.now();
+
+    function tick(now) {
+      const elapsed = now - lastFrameTime;
+      lastFrameTime = now;
+
+      // Apply friction
+      velocity *= Math.pow(FRICTION, elapsed / FRAME_MS);
+
+      if (Math.abs(velocity) < MIN_VELOCITY) {
+        scrollRAF = null;
+        return;
+      }
+
+      // Convert velocity to line delta for this frame
+      const pixelDelta = velocity * elapsed;
+      const lineHeight = getLineHeight();
+      const lineDelta = Math.round(pixelDelta / lineHeight);
+
+      if (lineDelta !== 0 && term.scrollLines) {
+        term.scrollLines(-lineDelta);
+      }
+
+      scrollRAF = requestAnimationFrame(tick);
+    }
+
+    scrollRAF = requestAnimationFrame(tick);
   }
 
   function showLoading() {
