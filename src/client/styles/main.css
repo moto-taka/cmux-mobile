@@ -321,6 +321,17 @@ ul {
   background: #000;
 }
 
+.terminal-container {
+  position: absolute;
+  inset: 0;
+  background: #1e1e2e;
+  padding: 4px;
+}
+
+.terminal-container .xterm {
+  height: 100%;
+}
+
 /* ─── Info Panel ─── */
 
 .info-panel {

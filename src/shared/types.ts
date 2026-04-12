@@ -24,12 +24,12 @@ export interface Surface {
 // ─── Server ↔ Client Messages ───
 
 export interface ServerMessage {
-  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'active_view_change' | 'error';
+  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'active_view_change' | 'terminal_output' | 'terminal_attached' | 'error';
   data: unknown;
 }
 
 export interface ClientMessage {
-  type: 'select_workspace' | 'select_surface' | 'send_text' | 'send_key' | 'refresh' | 'view_changed';
+  type: 'select_workspace' | 'select_surface' | 'send_text' | 'send_key' | 'refresh' | 'view_changed' | 'terminal_attach' | 'terminal_detach' | 'terminal_input';
   data: unknown;
 }
 

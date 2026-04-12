@@ -8,9 +8,6 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
-import http from 'http';
-import { WebSocket as Ws } from 'ws';
-import proxy from '@fastify/http-proxy';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
 
@@ -23,7 +20,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   const fullConfig: ServerConfig = {
     port: config.port ?? 3456,
     host: config.host ?? '0.0.0.0',
-    socketPath: config.socketPath ?? process.env.CMUX_SOCKET_PATH ?? '/tmp/cmux.sock',
+    socketPath: config.socketPath ?? process.env.CMUX_SOCKET_PATH ?? join(os.homedir(), 'Library/Application Support/cmux/cmux.sock'),
     ttydBasePort: config.ttydBasePort ?? 9001,
     tunnel: config.tunnel ?? true,
   };
@@ -133,11 +130,94 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
       });
 
       socket.on('close', () => {
+        stopTerminalStream(clientId);
         clients.delete(clientId);
         broadcast({ type: 'active_view_change', data: { clientId, workspaceId: null, surfaceId: null } });
       });
     });
   });
+
+  // ─── Terminal Mirror (cmux capture-pane → browser) ───
+
+  const terminalStreams = new Map<string, {
+    interval: ReturnType<typeof setInterval>;
+    lastOutput: string;
+    viewers: Set<string>;
+    workspaceId: string;
+    surfaceId: string | null;
+  }>();
+
+  function startTerminalStream(viewerClientId: string, workspaceId: string, surfaceId: string | null) {
+    const key = `${workspaceId}:${surfaceId ?? 'active'}`;
+
+    let stream = terminalStreams.get(key);
+    if (!stream) {
+      stream = {
+        interval: setInterval(async () => {
+          if (!stream) return;
+          try {
+            const output = await cmux.capturePane(workspaceId, surfaceId ?? undefined);
+            if (output && output !== stream.lastOutput) {
+              if (!stream.lastOutput) {
+                console.log(`   [mirror] First capture for ${workspaceId}, ${output.length} bytes`);
+              }
+              stream.lastOutput = output;
+              const data = JSON.stringify({ type: 'terminal_output', data: { workspaceId, surfaceId, content: output } });
+              for (const viewerId of stream.viewers) {
+                const client = clients.get(viewerId);
+                if (client?.socket.readyState === 1) {
+                  client.socket.send(data);
+                }
+              }
+            }
+          } catch {
+            // cmux not available — skip this tick
+          }
+        }, 300),
+        lastOutput: '',
+        viewers: new Set(),
+        workspaceId,
+        surfaceId,
+      };
+      terminalStreams.set(key, stream);
+    }
+
+    stream.viewers.add(viewerClientId);
+
+    // Send initial snapshot immediately
+    cmux.capturePane(workspaceId, surfaceId ?? undefined).then((output) => {
+      if (output && stream) {
+        stream.lastOutput = output;
+        const client = clients.get(viewerClientId);
+        if (client?.socket.readyState === 1) {
+          client.socket.send(JSON.stringify({ type: 'terminal_attached', data: { workspaceId, surfaceId } }));
+          client.socket.send(JSON.stringify({ type: 'terminal_output', data: { workspaceId, surfaceId, content: output } }));
+        }
+      }
+    }).catch(() => {});
+
+    const client = clients.get(viewerClientId);
+    if (client) {
+      (client as any).__terminalStreamKey = key;
+    }
+  }
+
+  function stopTerminalStream(viewerClientId: string) {
+    const client = clients.get(viewerClientId);
+    if (!client) return;
+    const key = (client as any).__terminalStreamKey;
+    if (!key) return;
+    (client as any).__terminalStreamKey = null;
+
+    const stream = terminalStreams.get(key);
+    if (stream) {
+      stream.viewers.delete(viewerClientId);
+      if (stream.viewers.size === 0) {
+        clearInterval(stream.interval);
+        terminalStreams.delete(key);
+      }
+    }
+  }
 
   // ─── Client message handler ───
 
@@ -180,6 +260,22 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         );
         break;
       }
+      case 'terminal_attach': {
+        const { workspaceId, surfaceId } = msg.data as { workspaceId: string; surfaceId: string | null };
+        startTerminalStream(clientId, workspaceId, surfaceId);
+        break;
+      }
+      case 'terminal_detach': {
+        stopTerminalStream(clientId);
+        break;
+      }
+      case 'terminal_input': {
+        const { surfaceId, data } = msg.data as { surfaceId: string; data: string };
+        if (surfaceId) {
+          await cmux.sendText(surfaceId, data);
+        }
+        break;
+      }
     }
   }
 
@@ -218,80 +314,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     });
 
     broadcast({ type: 'workspaces', data: workspaces });
-  });
-
-  // ─── ttyd Proxy (@fastify/http-proxy) ───
-  // Register one proxy per ttyd port AFTER workspaces are discovered.
-  // @fastify/http-proxy handles both HTTP and WebSocket proxying.
-
-  const registeredProxies = new Set<number>();
-
-  function registerTtydProxy(ttydPort: number) {
-    if (registeredProxies.has(ttydPort)) return;
-    registeredProxies.add(ttydPort);
-
-    // HTTP proxy only — WebSocket handled separately to avoid ERR_HTTP_SOCKET_ASSIGNED
-    fastify.register(proxy, {
-      upstream: `http://localhost:${ttydPort}`,
-      prefix: `/ttyd/${ttydPort}`,
-      websocket: false,
-      rewritePrefix: '/',
-      async preHandler(req, _reply) {
-        // Store ttydPort for the onSend hook
-        (req as any).__ttydPort = ttydPort;
-      },
-    });
-
-    // Inject WebSocket override into proxied ttyd HTML
-    fastify.addHook('onSend', async (req, reply, payload) => {
-      const port = (req as any).__ttydPort;
-      if (!port) return payload;
-      const ct = reply.getHeader('content-type') as string;
-      if (typeof ct !== 'string' || !ct.includes('text/html')) return payload;
-
-      const inject = `<script>window.__ttydPort='${port}';(function(){var O=window.WebSocket;window.WebSocket=function(u,p){if(/\\/ws/.test(u)){u=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ttyd-ws/'+window.__ttydPort}return new O(u,p)}})()</script>`;
-      const body = typeof payload === 'string' ? payload : String(payload);
-      return body.replace('<head>', '<head>' + inject);
-    });
-
-    console.log(`   [proxy] /ttyd/${ttydPort} → localhost:${ttydPort}`);
-  }
-
-  // WebSocket bridge: /ttyd-ws/:port → ws://localhost:port/ws
-  // ttyd's JS creates WebSocket at /ws, but we need to route it through our server.
-  // The client injects window.__ttydPort and overrides WebSocket to use this path.
-  fastify.register(async function (fastify) {
-    fastify.get('/ttyd-ws/:port', { websocket: true }, (socket, req) => {
-      const ttydPort = parseInt((req.params as any).port, 10);
-      if (isNaN(ttydPort) || ttydPort < 1) {
-        socket.close();
-        return;
-      }
-
-      const target = new Ws(`ws://localhost:${ttydPort}/ws`);
-
-      target.on('open', () => {
-        socket.on('message', (raw: any) => {
-          if (target.readyState === 1) target.send(raw);
-        });
-        socket.on('close', () => {
-          if (target.readyState === 1) target.close();
-        });
-      });
-
-      target.on('message', (data: Buffer) => {
-        if (socket.readyState === 1) socket.send(data);
-      });
-
-      target.on('close', () => {
-        if (socket.readyState === 1) socket.close();
-      });
-
-      target.on('error', (err: Error) => {
-        console.error(`[ws-proxy] /ttyd-ws/${ttydPort} error:`, err.message);
-        if (socket.readyState === 1) socket.close();
-      });
-    });
   });
 
   // ─── REST API ───
@@ -343,32 +365,11 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   await refreshWorkspaces();
 
-  // Register ttyd proxies for discovered workspaces BEFORE listen
-  for (const ws of workspaces) {
-    if (ws.ttydPort) {
-      // Health check: verify ttyd is reachable before registering proxy
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const req = http.get(`http://localhost:${ws.ttydPort}/`, { timeout: 3000 }, (res) => {
-            res.resume();
-            resolve();
-          });
-          req.on('error', reject);
-          req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-        });
-        registerTtydProxy(ws.ttydPort);
-      } catch (err: any) {
-        console.warn(`   ⚠ ttyd port ${ws.ttydPort} not reachable, skipping proxy (${err.message})`);
-      }
-    }
-  }
-
   if (workspaces.length > 0) {
     console.log(`   ✓ ${workspaces.length} workspaces found:`);
     for (const ws of workspaces) {
       const branch = ws.git_branch ? ` (${ws.git_branch})` : '';
-      const ttydPort = ws.ttydPort ? ` → :${ws.ttydPort}` : '';
-      console.log(`     - ${ws.name}${branch}${ttydPort}`);
+      console.log(`     - ${ws.name}${branch}`);
     }
   } else {
     console.log('   ⚠ No workspaces found');

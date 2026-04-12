@@ -1,9 +1,11 @@
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, execFile, ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
-import { exec } from 'node:child_process';
 import * as net from 'node:net';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_BASE_PORT = 9001;
 const MAX_PORT = 65535;
@@ -14,6 +16,7 @@ interface TtydProcessInfo {
   process: ChildProcess;
   cwd: string;
   name: string;
+  sanitizedId: string;
 }
 
 interface WorkspaceInput {
@@ -46,12 +49,20 @@ const TTYD_THEME = JSON.stringify({
   brightWhite: '#a6adc8',
 });
 
+const CMUX_BIN_PATHS = [
+  '/Applications/cmux-superset.app/Contents/Resources/bin/cmux',
+  path.join(os.homedir(), '.local/bin/cmux'),
+  '/usr/local/bin/cmux',
+];
+
 export class TtydManager {
   private processes = new Map<string, TtydProcessInfo>();
   private basePort: number;
   private nextPort: number;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private ttydAvailable: boolean | null = null;
+  private tmuxAvailable = false;
+  private cmuxBinPath: string | null = null;
   private shuttingDown = false;
 
   constructor(basePort: number = DEFAULT_BASE_PORT) {
@@ -60,12 +71,22 @@ export class TtydManager {
   }
 
   async start(): Promise<void> {
-    this.ttydAvailable = await this.checkTtydAvailable();
+    this.ttydAvailable = await this.checkBinaryAvailable('ttyd');
     if (!this.ttydAvailable) {
       console.error(
         'ttydが見つかりません。brew install ttyd でインストールしてください。'
       );
       return;
+    }
+
+    this.tmuxAvailable = await this.checkBinaryAvailable('tmux');
+    this.cmuxBinPath = await this.findCmuxBin();
+
+    if (this.tmuxAvailable) {
+      console.log('   ✓ tmux available — session sharing enabled');
+    }
+    if (this.cmuxBinPath) {
+      console.log(`   ✓ cmux CLI found — content capture enabled`);
     }
 
     this.startHealthCheck();
@@ -129,8 +150,63 @@ export class TtydManager {
     return result;
   }
 
+  /**
+   * Capture cmux surface terminal content and inject into the ttyd tmux session.
+   * This allows the phone user to see existing terminal history from cmux.
+   */
+  async injectCmuxContent(workspaceId: string): Promise<void> {
+    if (!this.tmuxAvailable || !this.cmuxBinPath) return;
+
+    const info = this.processes.get(workspaceId);
+    if (!info) return;
+
+    try {
+      // Capture cmux surface content with scrollback (safe: workspaceId is UUID)
+      const { stdout } = await execFileAsync(
+        this.cmuxBinPath,
+        ['capture-pane', '--workspace', workspaceId, '--scrollback', '--lines', '200'],
+        { timeout: 5000 }
+      );
+
+      if (!stdout || !stdout.trim()) return;
+
+      // Save to temp file (ANSI codes preserved, safe temp name)
+      const tmpFile = path.join(os.tmpdir(), `cmux-capture-${info.sanitizedId}.txt`);
+      fs.writeFileSync(tmpFile, stdout);
+
+      const session = `cmux-${info.sanitizedId}`;
+
+      // Send Enter to ensure we're at a prompt, then display captured content
+      await execFileAsync('tmux', ['send-keys', '-t', session, '', 'C-m']);
+      await execFileAsync('tmux', [
+        'send-keys', '-t', session,
+        `clear && printf '\\033[33m── cmux history ──\\033[0m\\n' && cat '${tmpFile}' && printf '\\033[33m── end history ──\\033[0m\\n' && rm -f '${tmpFile}'`,
+        'C-m',
+      ]);
+    } catch {
+      // cmux not running or surface not available — silent fail
+    }
+  }
+
+  // ─── Private: spawning ───
+
+  private sanitizeId(id: string): string {
+    // tmux session names cannot contain : or .
+    return id.replace(/[:.]/g, '_').substring(0, 50);
+  }
+
   private async spawnTtyd(workspace: WorkspaceInput): Promise<void> {
     const port = await this.findAvailablePort();
+    const sanitizedId = this.sanitizeId(workspace.id);
+
+    // Build shell command: tmux for session sharing, fallback to login shell
+    let shellCmd: string;
+    if (this.tmuxAvailable) {
+      const session = `cmux-${sanitizedId}`;
+      shellCmd = `tmux -f /dev/null new-session -A -s ${session} bash -l`;
+    } else {
+      shellCmd = 'bash -l';
+    }
 
     const proc = spawn(
       'ttyd',
@@ -140,12 +216,12 @@ export class TtydManager {
         '--writable',
         '-t', 'fontSize=14',
         '-t', `theme=${TTYD_THEME}`,
-        'bash',
+        shellCmd,
       ],
       {
         cwd: workspace.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
       }
     );
 
@@ -178,13 +254,33 @@ export class TtydManager {
       process: proc,
       cwd: workspace.cwd,
       name: workspace.name,
+      sanitizedId,
     });
+
+    // Configure tmux session after it starts (fire-and-forget, safe args)
+    if (this.tmuxAvailable) {
+      const session = `cmux-${sanitizedId}`;
+      setTimeout(() => {
+        execFile('tmux', ['set-option', '-t', session, 'status', 'off'], () => {});
+        execFile('tmux', ['set-option', '-t', session, 'history-limit', '50000'], () => {});
+        execFile('tmux', ['set-option', '-t', session, '-w', 'aggressive-resize', 'on'], () => {});
+      }, 2000);
+    }
   }
 
   private async killProcess(
     _workspaceId: string,
     info: TtydProcessInfo
   ): Promise<void> {
+    // Kill tmux session if using tmux
+    if (this.tmuxAvailable) {
+      try {
+        await execFileAsync('tmux', ['kill-session', '-t', `cmux-${info.sanitizedId}`]);
+      } catch {
+        // Ignore — session may already be dead
+      }
+    }
+
     return new Promise((resolve) => {
       const proc = info.process;
       const timeout = setTimeout(() => {
@@ -201,12 +297,32 @@ export class TtydManager {
     });
   }
 
-  private async checkTtydAvailable(): Promise<boolean> {
+  // ─── Private: binary detection ───
+
+  private async checkBinaryAvailable(name: string): Promise<boolean> {
     try {
-      await execAsync('which ttyd');
+      await execFileAsync('which', [name]);
       return true;
     } catch {
       return false;
+    }
+  }
+
+  private async findCmuxBin(): Promise<string | null> {
+    for (const p of CMUX_BIN_PATHS) {
+      try {
+        await fs.promises.access(p, fs.constants.X_OK);
+        return p;
+      } catch {
+        continue;
+      }
+    }
+    // Try PATH as last resort
+    try {
+      const { stdout } = await execFileAsync('which', ['cmux']);
+      return stdout.trim() || null;
+    } catch {
+      return null;
     }
   }
 

@@ -1,11 +1,21 @@
 import net from 'node:net';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { JSONRPCClient, isJSONRPCRequest } from 'json-rpc-2.0';
 import type { JSONRPCRequest } from 'json-rpc-2.0';
 import type { Workspace, Surface } from '../shared/types.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+const CMUX_BIN_PATHS = [
+  '/Applications/cmux-superset.app/Contents/Resources/bin/cmux',
+  path.join(os.homedir(), '.local/bin/cmux'),
+  '/usr/local/bin/cmux',
+];
 
 type EventCallback = (...args: unknown[]) => void;
 
@@ -14,7 +24,7 @@ interface CmuxSocketClientOptions {
   pollInterval?: number;
 }
 
-const DEFAULT_SOCKET_PATH = '/tmp/cmux.sock';
+const DEFAULT_SOCKET_PATH = path.join(os.homedir(), 'Library/Application Support/cmux/cmux.sock');
 const RECONNECT_BASE_DELAY = 3000;
 const MAX_RECONNECT_DELAY = 30000;
 const REQUEST_TIMEOUT = 10000;
@@ -217,6 +227,53 @@ export class CmuxSocketClient {
 
   async sendKey(surfaceId: string, key: string): Promise<void> {
     await this.request('surface.send_key', { surface_id: surfaceId, key });
+  }
+
+  /**
+   * Capture the visible content of a cmux surface (terminal pane).
+   * Uses the cmux CLI `capture-pane` command.
+   * Returns raw text with ANSI escape codes preserved.
+   */
+  async capturePane(workspaceId: string, surfaceId?: string): Promise<string> {
+    const cmuxBin = await this.findCmuxBin();
+    if (!cmuxBin) return '';
+
+    const args = ['capture-pane', '--workspace', workspaceId, '--scrollback', '--lines', '200'];
+    if (surfaceId) {
+      args.push('--surface', surfaceId);
+    }
+
+    try {
+      const { stdout } = await execFileAsync(cmuxBin, args, { timeout: 3000 });
+      return stdout || '';
+    } catch {
+      return '';
+    }
+  }
+
+  private _cmuxBinCache: string | null | undefined = undefined;
+
+  private async findCmuxBin(): Promise<string | null> {
+    if (this._cmuxBinCache !== undefined) return this._cmuxBinCache;
+
+    for (const p of CMUX_BIN_PATHS) {
+      try {
+        await fs.promises.access(p, fs.constants.X_OK);
+        this._cmuxBinCache = p;
+        return p;
+      } catch {
+        continue;
+      }
+    }
+    try {
+      const { stdout } = await execFileAsync('which', ['cmux']);
+      const bin = stdout.trim();
+      this._cmuxBinCache = bin || null;
+      return this._cmuxBinCache;
+    } catch {
+      this._cmuxBinCache = null;
+      return null;
+    }
   }
 
   // ─── Private helpers ───

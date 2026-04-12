@@ -1,4 +1,4 @@
-// cmux mobile web client
+// cmux mobile web client — terminal mirror via xterm.js + cmux capture-pane
 
 (function () {
   'use strict';
@@ -17,6 +17,8 @@
 
   let clientId = null;
   let isApplyingRemoteChange = false;
+  let term = null; // xterm.js Terminal instance
+  let terminalAttached = false;
 
   // ─── DOM refs ───
 
@@ -33,23 +35,82 @@
   const infoClose = $('#info-close');
   const infoContent = $('#info-content');
   const surfaceTabs = $('#surface-tabs');
-  const ttydFrame = $('#ttyd-frame');
+  const terminalContainer = $('#terminal-container');
   const loadingScreen = $('#loading-screen');
   const errorScreen = $('#error-screen');
   const retryBtn = $('#retry-btn');
   const connStatus = $('#conn-status');
   const toastContainer = $('#toast-container');
 
+  // ─── Terminal (xterm.js) ───
+
+  function initTerminal() {
+    if (term) return term;
+
+    if (typeof Terminal === 'undefined') {
+      console.error('[cmux] xterm.js not loaded');
+      return null;
+    }
+
+    term = new Terminal({
+      theme: {
+        background: '#1e1e2e',
+        foreground: '#cdd6f4',
+        cursor: '#f5e0dc',
+        cursorAccent: '#1e1e2e',
+        selectionBackground: '#585b70',
+        black: '#45475a',
+        red: '#f38ba8',
+        green: '#a6e3a1',
+        yellow: '#f9e2af',
+        blue: '#89b4fa',
+        magenta: '#f5c2e7',
+        cyan: '#94e2d5',
+        white: '#bac2de',
+        brightBlack: '#585b70',
+        brightRed: '#f38ba8',
+        brightGreen: '#a6e3a1',
+        brightYellow: '#f9e2af',
+        brightBlue: '#89b4fa',
+        brightMagenta: '#f5c2e7',
+        brightCyan: '#94e2d5',
+        brightWhite: '#a6adc8',
+      },
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      fontSize: 14,
+      cursorBlink: true,
+      scrollback: 5000,
+      convertEol: true,
+    });
+
+    term.open(terminalContainer);
+
+    // Send user input to cmux via server
+    term.onData((data) => {
+      if (currentSurfaceId) {
+        send({ type: 'terminal_input', data: { surfaceId: currentSurfaceId, data } });
+      }
+    });
+
+    // Resize handling
+    const resizeObserver = new ResizeObserver(() => {
+      if (term) term.fit && term.fit();
+    });
+    resizeObserver.observe(terminalContainer);
+
+    return term;
+  }
+
   function showLoading() {
     loadingScreen.classList.remove('hidden');
     errorScreen.style.display = 'none';
-    ttydFrame.style.display = 'none';
+    terminalContainer.style.display = 'none';
   }
 
   function showError() {
     loadingScreen.classList.add('hidden');
     errorScreen.style.display = 'flex';
-    ttydFrame.style.display = 'none';
+    terminalContainer.style.display = 'none';
     connStatus.className = 'conn-status';
     connStatus.title = 'Disconnected';
   }
@@ -57,7 +118,16 @@
   function showTerminal() {
     loadingScreen.classList.add('hidden');
     errorScreen.style.display = 'none';
-    ttydFrame.style.display = 'block';
+    terminalContainer.style.display = 'block';
+    if (!term) {
+      initTerminal();
+    }
+    if (term) {
+      // Resize to fit container
+      setTimeout(() => {
+        if (term && term.fit) term.fit();
+      }, 100);
+    }
   }
 
   function setConnStatus(state) {
@@ -68,7 +138,6 @@
   // ─── Toast Notifications ───
 
   function showToast(message, type) {
-    // type: 'info' (default), 'error', 'success'
     const toast = document.createElement('div');
     toast.className = 'toast' + (type ? ' ' + type : '');
     toast.textContent = message;
@@ -117,6 +186,7 @@
       console.log('[cmux] WebSocket closed, reconnecting...');
       setConnStatus('');
       showToast('Disconnected — reconnecting...', 'error');
+      detachTerminal();
       if (workspaces.length === 0) showError();
       scheduleReconnect();
     };
@@ -127,7 +197,6 @@
   }
 
   function getReconnectDelay() {
-    // Exponential backoff: 3s, 6s, 12s, ... max 30s
     const base = 3000;
     const delay = Math.min(base * Math.pow(1.5, reconnectAttempts), 30000);
     reconnectAttempts++;
@@ -162,6 +231,27 @@
     }
   }
 
+  // ─── Terminal attach/detach ───
+
+  function attachTerminal(workspaceId, surfaceId) {
+    if (terminalAttached) {
+      send({ type: 'terminal_detach', data: {} });
+    }
+    terminalAttached = true;
+    send({
+      type: 'terminal_attach',
+      data: { workspaceId, surfaceId },
+    });
+    showTerminal();
+  }
+
+  function detachTerminal() {
+    if (terminalAttached) {
+      terminalAttached = false;
+      send({ type: 'terminal_detach', data: {} });
+    }
+  }
+
   // ─── Message Handling ───
 
   function handleMessage(msg) {
@@ -181,7 +271,6 @@
           if (exists) {
             selectWorkspace(hashState.workspaceId);
             if (hashState.surfaceId) selectSurface(hashState.surfaceId);
-            showTerminal();
             break;
           }
         }
@@ -189,10 +278,9 @@
         // フォールバック: 最初のworkspaceを自動選択
         if (!currentWorkspaceId && workspaces.length > 0) {
           selectWorkspace(workspaces[0].id);
-          showTerminal();
         } else if (currentWorkspaceId) {
           renderSurfaceTabs();
-          updateTtydFrame();
+          attachTerminalForCurrentSurface();
           showTerminal();
         }
         break;
@@ -207,6 +295,13 @@
       case 'error':
         console.error('[cmux] Server error:', msg.data);
         showToast(String(msg.data), 'error');
+        break;
+      case 'terminal_attached':
+        console.log('[cmux] Terminal stream attached');
+        if (term) term.clear();
+        break;
+      case 'terminal_output':
+        handleTerminalOutput(msg.data);
         break;
       case 'active_view_change': {
         const change = msg.data;
@@ -228,7 +323,7 @@
             currentSurfaceId = change.surfaceId;
           }
           renderSurfaceTabs();
-          updateTtydFrame();
+          attachTerminalForCurrentSurface();
           updateInfoPanel();
           updateHash();
         } finally {
@@ -236,6 +331,23 @@
         }
         break;
       }
+    }
+  }
+
+  function handleTerminalOutput(data) {
+    if (!term) {
+      initTerminal();
+    }
+    if (!term || !data.content) return;
+
+    // Write the captured terminal content
+    // Use cursor home + content + clear to end for clean redraw
+    const content = data.content;
+    if (content) {
+      // Clear and rewrite — capture-pane gives full screen content
+      term.write('\x1b[H'); // Cursor home
+      term.write(content);
+      term.write('\x1b[J'); // Clear from cursor to end of screen
     }
   }
 
@@ -255,6 +367,10 @@
       closeSidebar();
       return;
     }
+
+    // Detach from previous terminal
+    detachTerminal();
+
     currentWorkspaceId = workspaceId;
     currentSurfaceId = null;
 
@@ -268,7 +384,7 @@
     }
 
     renderSurfaceTabs();
-    updateTtydFrame();
+    attachTerminalForCurrentSurface();
     updateInfoPanel();
     updateHash();
     closeSidebar();
@@ -285,9 +401,11 @@
 
   function selectSurface(surfaceId) {
     if (currentSurfaceId === surfaceId) return;
+
+    detachTerminal();
     currentSurfaceId = surfaceId;
     renderSurfaceTabs();
-    updateTtydFrame();
+    attachTerminalForCurrentSurface();
     updateHash();
 
     if (currentWorkspaceId) {
@@ -295,6 +413,12 @@
     }
     if (clientId && !isApplyingRemoteChange) {
       send({ type: 'view_changed', data: { clientId, workspaceId: currentWorkspaceId, surfaceId } });
+    }
+  }
+
+  function attachTerminalForCurrentSurface() {
+    if (currentWorkspaceId) {
+      attachTerminal(currentWorkspaceId, currentSurfaceId);
     }
   }
 
@@ -347,7 +471,6 @@
 
       const name = document.createElement('span');
       name.className = 'ws-name';
-      // Truncate long names, show tooltip with full name
       name.textContent = wsObj.name.length > 28 ? wsObj.name.slice(0, 26) + '...' : wsObj.name;
       name.title = wsObj.name;
 
@@ -361,7 +484,6 @@
         branch.textContent = wsObj.git_branch;
         li.appendChild(branch);
       } else if (wsObj.cwd) {
-        // Show directory basename as fallback when no git branch
         const cwd = document.createElement('span');
         cwd.className = 'ws-branch';
         const parts = wsObj.cwd.split('/');
@@ -410,33 +532,6 @@
     });
   }
 
-  function updateTtydFrame() {
-    if (!currentWorkspaceId) return;
-    const wsObj = getWorkspace(currentWorkspaceId);
-    if (!wsObj) return;
-
-    if (wsObj.ttydPort) {
-      // Always use server proxy path (/ttyd/PORT/) so it works through tunnel
-      const url = '/ttyd/' + wsObj.ttydPort + '/';
-      if (ttydFrame.src !== url) {
-        showLoading();
-        fetch(url, { mode: 'no-cors', cache: 'no-store' })
-          .then(() => {
-            ttydFrame.src = url;
-            showTerminal();
-          })
-          .catch(() => {
-            setTimeout(() => {
-              const current = getWorkspace(currentWorkspaceId);
-              if (current && current.ttydPort === wsObj.ttydPort) {
-                showError();
-              }
-            }, 2000);
-          });
-      }
-    }
-  }
-
   function updateInfoPanel() {
     const wsObj = getWorkspace(currentWorkspaceId);
     if (!wsObj) {
@@ -456,18 +551,15 @@
     infoContent.appendChild(createInfoRow('cwd', wsObj.cwd));
     infoContent.appendChild(createInfoRow('branch', wsObj.git_branch || '-'));
 
-    // Status row with colored text
     const statusRow = createInfoRow('status', wsObj.status || 'unknown');
     const val = statusRow.querySelector('.info-value');
     val.className = 'info-value ws-status-text ' + statusClass;
     infoContent.appendChild(statusRow);
 
-    // Surfaces count
     if (wsObj.surfaces && wsObj.surfaces.length > 0) {
       infoContent.appendChild(createInfoRow('surfaces', String(wsObj.surfaces.length)));
     }
 
-    // Progress bar
     if (typeof wsObj.progress === 'number' && wsObj.progress > 0) {
       const progressRow = document.createElement('div');
       progressRow.className = 'info-row';
@@ -490,7 +582,6 @@
       infoContent.appendChild(bar);
     }
 
-    // Latest log
     if (wsObj.latest_log) {
       infoContent.appendChild(createDivider());
       const title = document.createElement('div');
@@ -581,13 +672,11 @@
     const ady = Math.abs(rawDy);
     const dt = Date.now() - touchStartTime;
 
-    // Swipe down on info panel to close (vertical swipe)
     if (infoPanelOpen && rawDy > 50 && ady > Math.abs(dx)) {
       closeInfoPanel();
       return;
     }
 
-    // Ignore slow swipes and non-horizontal movements for sidebar
     if (ady > Math.abs(dx) || dt > 500) return;
 
     if (sidebarOpen && dx < -50) {
@@ -613,7 +702,6 @@
     refreshing = true;
     refreshBtn.classList.add('spinning');
     send({ type: 'refresh', data: {} });
-    // Stop spinner after 2s regardless (server response comes via WS update)
     setTimeout(() => {
       refreshing = false;
       refreshBtn.classList.remove('spinning');
