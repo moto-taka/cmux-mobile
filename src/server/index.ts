@@ -8,8 +8,7 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
-import http from 'http';
-import { WebSocket as Ws } from 'ws';
+import proxy from '@fastify/http-proxy';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
 
@@ -60,11 +59,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   // ─── REST Auth Hook ───
 
   fastify.addHook('onRequest', async (req, reply) => {
-    // Skip auth for static assets (HTML/JS/CSS served to browser)
-    // The real auth happens on WebSocket upgrade
     if (req.url === '/' || req.url.startsWith('/?token=')) return;
     if (req.url.startsWith('/app.js') || req.url.startsWith('/styles/') || req.url.startsWith('/sw.js') || req.url.startsWith('/manifest.json')) return;
-    // API endpoints require token for remote access
     if (req.url.startsWith('/api/') && !isLocalRequest(req)) {
       if (!validateToken(req)) {
         return reply.code(403).send({ error: 'Forbidden' });
@@ -92,7 +88,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   fastify.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, (socket, req) => {
-      // Token auth for remote connections
       if (!isLocalRequest(req) && !validateToken(req)) {
         socket.send(JSON.stringify({ type: 'error', data: 'Unauthorized: invalid token' }));
         socket.close();
@@ -116,7 +111,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         socket.send(JSON.stringify({ type: 'workspaces', data: workspaces }));
       }
 
-      // Notify new client about other clients' current view state
       for (const [id, client] of clients) {
         if (id === clientId) continue;
         if (client.currentWorkspaceId) {
@@ -212,7 +206,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   cmux.on('workspace_changed', async (wsList: unknown) => {
     const list = (wsList as Workspace[]) ?? [];
 
-    // Sync ttyd first, then enrich with port info
     await ttyd.syncWorkspaces(
       list.map((w) => ({ id: w.id, cwd: w.cwd, name: w.name }))
     ).catch(() => {});
@@ -225,128 +218,25 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     broadcast({ type: 'workspaces', data: workspaces });
   });
 
-  // ─── ttyd Proxy ───
-  // Proxy ttyd HTTP and WebSocket through the main server so remote clients
-  // (via localtunnel) can access ttyd without needing direct port access.
+  // ─── ttyd Proxy (@fastify/http-proxy) ───
+  // Register one proxy per ttyd port AFTER workspaces are discovered.
+  // @fastify/http-proxy handles both HTTP and WebSocket proxying.
 
-  function buildTtydInject(ttydPort: number): string {
-    return `<script>
-(function(){
-  window.__ttydPort = '${ttydPort}';
-  var OrigWS = window.WebSocket;
-  window.WebSocket = function(url, protocols) {
-    if (/ws[s]?:\\/\\/[^/]+\\/ws/.test(url)) {
-      url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ttyd-ws/' + window.__ttydPort;
-    }
-    return new OrigWS(url, protocols);
-  };
-})();
-</script>`;
+  const registeredProxies = new Set<number>();
+
+  function registerTtydProxy(ttydPort: number) {
+    if (registeredProxies.has(ttydPort)) return;
+    registeredProxies.add(ttydPort);
+
+    fastify.register(proxy, {
+      upstream: `http://localhost:${ttydPort}`,
+      prefix: `/ttyd/${ttydPort}`,
+      websocket: true,
+      rewritePrefix: '/',
+    });
+
+    console.log(`   [proxy] /ttyd/${ttydPort} → localhost:${ttydPort}`);
   }
-
-  // HTTP proxy: /ttyd/:port/* → http://localhost:port/*
-  fastify.all('/ttyd/:port/*', async (req, reply) => {
-    const ttydPort = parseInt((req.params as any).port, 10);
-    if (isNaN(ttydPort) || ttydPort < 1 || ttydPort > 65535) {
-      return reply.code(400).send('Invalid port');
-    }
-    const subPath = req.url.slice(`/ttyd/${ttydPort}`.length) || '/';
-
-    const proxyHeaders: Record<string, string> = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === 'string' && key !== 'host') {
-        proxyHeaders[key] = value;
-      }
-    }
-    proxyHeaders.host = `localhost:${ttydPort}`;
-
-    const options: http.RequestOptions = {
-      hostname: 'localhost',
-      port: ttydPort,
-      path: subPath,
-      method: req.method,
-      headers: proxyHeaders,
-    };
-
-    return new Promise<void>((resolve) => {
-      const proxyReq = http.request(options, (proxyRes) => {
-        const contentType = proxyRes.headers['content-type'] || '';
-        reply.code(proxyRes.statusCode || 200);
-
-        // Copy headers but skip encoding to avoid double-compression issues
-        for (const [key, value] of Object.entries(proxyRes.headers)) {
-          if (key.toLowerCase() !== 'content-encoding' && typeof value === 'string') {
-            reply.header(key, value);
-          }
-        }
-
-        if (contentType.includes('text/html')) {
-          // Inject WebSocket override script into HTML
-          let body = '';
-          proxyRes.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-          proxyRes.on('end', () => {
-            const injected = body.replace('<head>', '<head>' + buildTtydInject(ttydPort));
-            reply.header('content-length', Buffer.byteLength(injected));
-            reply.send(injected);
-            resolve();
-          });
-        } else {
-          proxyRes.pipe(reply.raw);
-          proxyRes.on('end', resolve);
-        }
-      });
-
-      proxyReq.on('error', (err) => {
-        reply.code(502).send('ttyd proxy error: ' + err.message);
-        resolve();
-      });
-
-      if (req.body && typeof req.body !== 'object') {
-        proxyReq.write(req.body);
-      } else if (req.raw) {
-        req.raw.pipe(proxyReq);
-      } else {
-        proxyReq.end();
-      }
-    });
-  });
-
-  // WebSocket proxy: /ttyd-ws/:port → ws://localhost:port/ws
-  fastify.register(async function (fastify) {
-    fastify.get('/ttyd-ws/:port', { websocket: true }, (socket, req) => {
-      const ttydPort = parseInt((req.params as any).port, 10);
-      if (isNaN(ttydPort)) {
-        socket.close();
-        return;
-      }
-
-      // Connect to the local ttyd WebSocket
-      const targetUrl = `ws://localhost:${ttydPort}/ws`;
-      const target = new Ws(targetUrl);
-
-      target.on('open', () => {
-        socket.on('message', (raw: any) => {
-          if (target.readyState === 1) target.send(raw);
-        });
-        socket.on('close', () => {
-          if (target.readyState === 1) target.close();
-        });
-      });
-
-      target.on('message', (data: Buffer) => {
-        if (socket.readyState === 1) socket.send(data);
-      });
-
-      target.on('close', () => {
-        if (socket.readyState === 1) socket.close();
-      });
-
-      target.on('error', (err: Error) => {
-        console.error('[cmux-mobile] ttyd WS proxy error:', err.message);
-        if (socket.readyState === 1) socket.close();
-      });
-    });
-  });
 
   // ─── REST API ───
 
@@ -397,12 +287,16 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   await refreshWorkspaces();
 
+  // Register ttyd proxies for discovered workspaces BEFORE listen
+  for (const ws of workspaces) {
+    if (ws.ttydPort) registerTtydProxy(ws.ttydPort);
+  }
+
   if (workspaces.length > 0) {
     console.log(`   ✓ ${workspaces.length} workspaces found:`);
     for (const ws of workspaces) {
-      const info = ttyd.getInfo(ws.id);
       const branch = ws.git_branch ? ` (${ws.git_branch})` : '';
-      const ttydPort = info ? ` → :${info.port}` : '';
+      const ttydPort = ws.ttydPort ? ` → :${ws.ttydPort}` : '';
       console.log(`     - ${ws.name}${branch}${ttydPort}`);
     }
   } else {
@@ -486,14 +380,12 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  // Prevent unhandled promise rejections from crashing the process
   process.on('unhandledRejection', (reason) => {
     console.error('[cmux-mobile] Unhandled rejection:', reason);
   });
 
   process.on('uncaughtException', (err) => {
     console.error('[cmux-mobile] Unhandled exception:', err);
-    // Attempt graceful shutdown on fatal errors
     shutdown();
   });
 
