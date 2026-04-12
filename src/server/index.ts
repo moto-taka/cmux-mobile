@@ -8,6 +8,7 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
+import http from 'http';
 import proxy from '@fastify/http-proxy';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
@@ -289,7 +290,22 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // Register ttyd proxies for discovered workspaces BEFORE listen
   for (const ws of workspaces) {
-    if (ws.ttydPort) registerTtydProxy(ws.ttydPort);
+    if (ws.ttydPort) {
+      // Health check: verify ttyd is reachable before registering proxy
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const req = http.get(`http://localhost:${ws.ttydPort}/`, { timeout: 3000 }, (res) => {
+            res.resume();
+            resolve();
+          });
+          req.on('error', reject);
+          req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        });
+        registerTtydProxy(ws.ttydPort);
+      } catch (err: any) {
+        console.warn(`   ⚠ ttyd port ${ws.ttydPort} not reachable, skipping proxy (${err.message})`);
+      }
+    }
   }
 
   if (workspaces.length > 0) {
