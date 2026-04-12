@@ -20,6 +20,14 @@
   let term = null; // xterm.js Terminal instance
   let terminalAttached = false;
 
+  // Pinch-zoom state
+  let pinchStartDistance = 0;
+  let pinchStartFontSize = 14;
+
+  // Extra keys sticky state
+  let ctrlActive = false;
+  let altActive = false;
+
   // ─── DOM refs ───
 
   const $ = (sel) => document.querySelector(sel);
@@ -41,6 +49,7 @@
   const retryBtn = $('#retry-btn');
   const connStatus = $('#conn-status');
   const toastContainer = $('#toast-container');
+  const extraKeysBar = $('#extra-keys-bar');
 
   // ─── Terminal (xterm.js) ───
 
@@ -51,6 +60,9 @@
       console.error('[cmux] xterm.js not loaded');
       return null;
     }
+
+    const savedFontSize = localStorage.getItem('cmux-font-size');
+    const initialFontSize = savedFontSize ? parseInt(savedFontSize, 10) : 14;
 
     term = new Terminal({
       theme: {
@@ -77,7 +89,7 @@
         brightWhite: '#a6adc8',
       },
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-      fontSize: 14,
+      fontSize: initialFontSize,
       cursorBlink: true,
       scrollback: 5000,
       convertEol: true,
@@ -97,6 +109,35 @@
       if (term) term.fit && term.fit();
     });
     resizeObserver.observe(terminalContainer);
+
+    // ── Pinch-zoom font resize ──
+
+    terminalContainer.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 2) return;
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      pinchStartDistance = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+      pinchStartFontSize = term.options.fontSize;
+    }, { passive: true });
+
+    terminalContainer.addEventListener('touchmove', (e) => {
+      if (e.touches.length !== 2) return;
+      e.preventDefault();
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      const distance = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+      const scale = distance / pinchStartDistance;
+      const newSize = Math.round(pinchStartFontSize * scale);
+      const clamped = Math.max(8, Math.min(32, newSize));
+      term.options.fontSize = clamped;
+      if (term.fit) term.fit();
+    }, { passive: false });
+
+    terminalContainer.addEventListener('touchend', (e) => {
+      if (e.touches.length >= 2) return; // still pinching
+      // Persist on pinch end
+      localStorage.setItem('cmux-font-size', String(term.options.fontSize));
+    }, { passive: true });
 
     return term;
   }
@@ -650,6 +691,91 @@
     } else {
       openInfoPanel();
     }
+  }
+
+  // ─── Extra Keys Bar ───
+
+  const EXTRA_KEY_SEQUENCES = {
+    'esc':         '\x1b',
+    'tab':         '\t',
+    'arrow-up':    '\x1b[A',
+    'arrow-down':  '\x1b[B',
+    'arrow-right': '\x1b[C',
+    'arrow-left':  '\x1b[D',
+    'slash':       '/',
+    'minus':       '-',
+    'tilde':       '~',
+    'pipe':        '|',
+    'amp':         '&',
+  };
+
+  function sendExtraKey(seq) {
+    if (!currentSurfaceId) return;
+    send({ type: 'terminal_input', data: { surfaceId: currentSurfaceId, data: seq } });
+  }
+
+  function applyModifiersAndSend(rawSeq) {
+    let seq = rawSeq;
+
+    if (ctrlActive) {
+      // For single printable chars (a-z, symbols): compute Ctrl+char
+      if (seq.length === 1 && seq >= 'a' && seq <= 'z') {
+        seq = String.fromCharCode(seq.charCodeAt(0) - 96); // Ctrl+A = \x01 ... Ctrl+Z = \x1a
+      } else if (seq.length === 1 && seq >= 'A' && seq <= 'Z') {
+        seq = String.fromCharCode(seq.charCodeAt(0) - 64);
+      } else if (seq === '/') {
+        seq = '\x1f'; // Ctrl+/
+      }
+      // Arrows/escape sequences: ignore Ctrl modifier (no standard mapping)
+    }
+
+    if (altActive) {
+      seq = '\x1b' + seq;
+    }
+
+    sendExtraKey(seq);
+
+    // Consume sticky modifiers after one use
+    if (ctrlActive) {
+      ctrlActive = false;
+      const ctrlBtn = extraKeysBar.querySelector('[data-key="ctrl"]');
+      if (ctrlBtn) ctrlBtn.classList.remove('active');
+    }
+    if (altActive) {
+      altActive = false;
+      const altBtn = extraKeysBar.querySelector('[data-key="alt"]');
+      if (altBtn) altBtn.classList.remove('active');
+    }
+  }
+
+  function onExtraKeyClick(e) {
+    const btn = e.currentTarget;
+    const key = btn.dataset.key;
+
+    if (key === 'ctrl') {
+      ctrlActive = !ctrlActive;
+      btn.classList.toggle('active', ctrlActive);
+      return;
+    }
+
+    if (key === 'alt') {
+      altActive = !altActive;
+      btn.classList.toggle('active', altActive);
+      return;
+    }
+
+    const seq = EXTRA_KEY_SEQUENCES[key];
+    if (seq) {
+      applyModifiersAndSend(seq);
+    }
+  }
+
+  // Bind click handlers to all extra key buttons
+  if (extraKeysBar) {
+    const ekBtns = extraKeysBar.querySelectorAll('.ek-btn');
+    ekBtns.forEach((btn) => {
+      btn.addEventListener('click', onExtraKeyClick);
+    });
   }
 
   // ─── Touch: Swipe gestures ───
