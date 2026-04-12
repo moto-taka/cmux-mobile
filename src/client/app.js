@@ -44,6 +44,7 @@
   const infoContent = $('#info-content');
   const surfaceTabs = $('#surface-tabs');
   const terminalContainer = $('#terminal-container');
+  const terminalArea = $('.terminal-area');
   const loadingScreen = $('#loading-screen');
   const errorScreen = $('#error-screen');
   const retryBtn = $('#retry-btn');
@@ -776,6 +777,48 @@
     ekBtns.forEach((btn) => {
       btn.addEventListener('click', onExtraKeyClick);
     });
+  }
+
+  // ─── Visual Viewport (keyboard resize) ───
+
+  let viewportResizeTimer = null;
+
+  function handleViewportResize() {
+    if (viewportResizeTimer) return;
+    viewportResizeTimer = setTimeout(() => {
+      viewportResizeTimer = null;
+      applyViewportLayout();
+    }, 150);
+  }
+
+  function applyViewportLayout() {
+    if (!window.visualViewport) return;
+
+    const vv = window.visualViewport;
+    const innerHeight = window.innerHeight;
+    // Keyboard height: the portion of the window covered by the software keyboard
+    const keyboardHeight = Math.max(0, innerHeight - vv.height - vv.offsetTop);
+
+    if (keyboardHeight > 0) {
+      // Keyboard is visible — move extra-keys-bar above the keyboard
+      extraKeysBar.style.bottom = keyboardHeight + 'px';
+      // Adjust terminal area padding to account for toolbar + keyboard gap
+      terminalArea.style.paddingBottom = 'var(--extra-keys-height)';
+    } else {
+      // Keyboard hidden — restore defaults
+      extraKeysBar.style.bottom = '';
+      terminalArea.style.paddingBottom = '';
+    }
+
+    // Re-fit xterm to new dimensions
+    if (term && term.fit) {
+      try { term.fit(); } catch (_) { /* ignore fit errors during transition */ }
+    }
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', handleViewportResize);
+    window.visualViewport.addEventListener('scroll', handleViewportResize);
   }
 
   // ─── Touch: Swipe gestures ───
