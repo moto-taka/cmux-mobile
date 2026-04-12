@@ -4,11 +4,12 @@ import fastifyWebSocket from '@fastify/websocket';
 import { CmuxSocketClient } from './cmux-socket.js';
 import { TtydManager } from './ttyd-manager.js';
 import crypto from 'crypto';
-import type { ServerConfig, Workspace, ServerMessage, ClientMessage, ActiveViewChange, ClientInfo } from '../shared/types.js';
+import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../shared/types.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
 import qrcode from 'qrcode-terminal';
+import localtunnel from 'localtunnel';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,7 +22,10 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     host: config.host ?? '0.0.0.0',
     socketPath: config.socketPath ?? process.env.CMUX_SOCKET_PATH ?? '/tmp/cmux.sock',
     ttydBasePort: config.ttydBasePort ?? 9001,
+    tunnel: config.tunnel ?? false,
   };
+
+  const accessToken = crypto.randomBytes(16).toString('hex');
 
   const cmux = new CmuxSocketClient({ socketPath: fullConfig.socketPath });
   const ttyd = new TtydManager(fullConfig.ttydBasePort);
@@ -36,6 +40,34 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   await fastify.register(fastifyStatic, {
     root: CLIENT_DIR,
     prefix: '/',
+  });
+
+  // ─── Token Auth Helper ───
+
+  function isLocalRequest(req: any): boolean {
+    const remote = req.ip ?? req.socket?.remoteAddress ?? '';
+    return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  }
+
+  function validateToken(req: any): boolean {
+    if (isLocalRequest(req)) return true;
+    const token = (req.query as any)?.token ?? req.headers['x-cmux-token'];
+    return token === accessToken;
+  }
+
+  // ─── REST Auth Hook ───
+
+  fastify.addHook('onRequest', async (req, reply) => {
+    // Skip auth for static assets (HTML/JS/CSS served to browser)
+    // The real auth happens on WebSocket upgrade
+    if (req.url === '/' || req.url.startsWith('/?token=')) return;
+    if (req.url.startsWith('/app.js') || req.url.startsWith('/styles/') || req.url.startsWith('/sw.js') || req.url.startsWith('/manifest.json')) return;
+    // API endpoints require token for remote access
+    if (req.url.startsWith('/api/') && !isLocalRequest(req)) {
+      if (!validateToken(req)) {
+        return reply.code(403).send({ error: 'Forbidden' });
+      }
+    }
   });
 
   // ─── Broadcast ───
@@ -57,7 +89,14 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   // ─── WebSocket (control channel) ───
 
   fastify.register(async function (fastify) {
-    fastify.get('/ws', { websocket: true }, (socket, _req) => {
+    fastify.get('/ws', { websocket: true }, (socket, req) => {
+      // Token auth for remote connections
+      if (!isLocalRequest(req) && !validateToken(req)) {
+        socket.send(JSON.stringify({ type: 'error', data: 'Unauthorized: invalid token' }));
+        socket.close();
+        return;
+      }
+
       const clientId = crypto.randomUUID();
       clients.set(clientId, {
         socket,
@@ -215,6 +254,10 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   console.log('\n🚀 cmux-mobile starting...\n');
   console.log(`   Socket: ${fullConfig.socketPath}`);
   console.log(`   Port:   ${fullConfig.port}`);
+  if (fullConfig.tunnel) {
+    console.log(`   Tunnel: enabled`);
+  }
+  console.log(`   Token:  ${accessToken}\n`);
 
   await ttyd.start();
 
@@ -255,9 +298,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     }
   }
 
-  console.log('\n📱 Access from your phone:');
+  console.log('\n📱 Access from your phone (same network):');
   for (const ip of ips) {
-    const url = `http://${ip}:${fullConfig.port}`;
+    const url = `http://${ip}:${fullConfig.port}?token=${accessToken}`;
     console.log(`   ${url}`);
     console.log();
     qrcode.generate(url, { small: true }, (qr: string) => {
@@ -266,6 +309,36 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     console.log();
   }
   console.log(`   Local: http://localhost:${fullConfig.port}\n`);
+
+  // ─── Tunnel (localtunnel) ───
+
+  let tunnel: localtunnel.Tunnel | null = null;
+
+  if (fullConfig.tunnel) {
+    try {
+      tunnel = await localtunnel({ port: fullConfig.port });
+      const tunnelUrl = `${tunnel.url}?token=${accessToken}`;
+
+      console.log('🌐 Access from anywhere (public tunnel):');
+      console.log(`   ${tunnelUrl}`);
+      console.log();
+      qrcode.generate(tunnelUrl, { small: true }, (qr: string) => {
+        console.log(qr);
+      });
+      console.log();
+      console.log('   ⚠  Share this URL only with trusted devices.\n');
+
+      tunnel.on('close', () => {
+        console.log('[cmux-mobile] Tunnel closed');
+      });
+
+      tunnel.on('error', (err: Error) => {
+        console.error('[cmux-mobile] Tunnel error:', err.message);
+      });
+    } catch (err) {
+      console.error('[cmux-mobile] Failed to start tunnel:', err);
+    }
+  }
 
   // ─── Graceful shutdown ───
 
@@ -277,6 +350,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     try {
       cmux.disconnect();
       await ttyd.stop();
+      if (tunnel) tunnel.close();
       await fastify.close();
     } catch (err) {
       console.error('Error during shutdown:', err);
@@ -293,7 +367,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   });
 
   process.on('uncaughtException', (err) => {
-    console.error('[cmux-mobile] Uncaught exception:', err);
+    console.error('[cmux-mobile] Unhandled exception:', err);
     // Attempt graceful shutdown on fatal errors
     shutdown();
   });

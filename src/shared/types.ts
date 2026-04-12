@@ -54,4 +54,5 @@ export interface ServerConfig {
   host: string;
   socketPath: string;
   ttydBasePort: number;
+  tunnel?: boolean;
 }

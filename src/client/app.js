@@ -82,12 +82,20 @@
 
   // ─── WebSocket ───
 
+  function getToken() {
+    const params = new URLSearchParams(location.search);
+    return params.get('token');
+  }
+
   function connectWS() {
     setConnStatus('connecting');
     showLoading();
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${location.host}/ws`;
-    ws = new WebSocket(url);
+    const token = getToken();
+    const wsUrl = token
+      ? `${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`
+      : `${protocol}//${location.host}/ws`;
+    ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       console.log('[cmux] WebSocket connected');
