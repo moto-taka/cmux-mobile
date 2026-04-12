@@ -130,6 +130,16 @@
       if (currentSurfaceId) {
         send({ type: 'terminal_input', data: { surfaceId: currentSurfaceId, data } });
       }
+      // Any user input resumes auto-scroll
+      userScrolledUp = false;
+    });
+
+    // Track scroll position — detect when user scrolls up into history
+    term.onScroll(() => {
+      if (!term.buffer || !term.buffer.active) return;
+      const activeBuffer = term.buffer.active;
+      // User is scrolled up if viewport top is not at the bottom of the scrollback
+      userScrolledUp = activeBuffer.viewportY < activeBuffer.baseY;
     });
 
     // Resize handling
@@ -603,6 +613,9 @@
     }
   }
 
+  // Track if user manually scrolled up — pause auto-scroll while browsing history
+  let userScrolledUp = false;
+
   function handleTerminalOutput(data) {
     if (!term) {
       initTerminal();
@@ -617,6 +630,11 @@
       term.write('\x1b[H'); // Cursor home
       term.write(content);
       term.write('\x1b[J'); // Clear from cursor to end of screen
+
+      // Auto-scroll to bottom unless user is browsing scrollback
+      if (!userScrolledUp && term.scrollToBottom) {
+        term.scrollToBottom();
+      }
     }
   }
 
