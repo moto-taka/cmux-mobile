@@ -416,19 +416,17 @@
     if (!wsObj) return;
 
     if (wsObj.ttydPort) {
-      const url = 'http://' + location.hostname + ':' + wsObj.ttydPort + '/';
+      // Always use server proxy path (/ttyd/PORT/) so it works through tunnel
+      const url = '/ttyd/' + wsObj.ttydPort + '/';
       if (ttydFrame.src !== url) {
         showLoading();
-        // Verify ttyd is reachable before loading the iframe
         fetch(url, { mode: 'no-cors', cache: 'no-store' })
           .then(() => {
             ttydFrame.src = url;
             showTerminal();
           })
           .catch(() => {
-            // ttyd not reachable — show error after a brief delay for transient issues
             setTimeout(() => {
-              // Only show error if this workspace is still selected
               const current = getWorkspace(currentWorkspaceId);
               if (current && current.ttydPort === wsObj.ttydPort) {
                 showError();

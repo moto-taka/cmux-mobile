@@ -8,6 +8,8 @@ import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../s
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
+import http from 'http';
+import { WebSocket as Ws } from 'ws';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
 
@@ -22,7 +24,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     host: config.host ?? '0.0.0.0',
     socketPath: config.socketPath ?? process.env.CMUX_SOCKET_PATH ?? '/tmp/cmux.sock',
     ttydBasePort: config.ttydBasePort ?? 9001,
-    tunnel: config.tunnel ?? false,
+    tunnel: config.tunnel ?? true,
   };
 
   const accessToken = crypto.randomBytes(16).toString('hex');
@@ -221,6 +223,129 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     });
 
     broadcast({ type: 'workspaces', data: workspaces });
+  });
+
+  // ─── ttyd Proxy ───
+  // Proxy ttyd HTTP and WebSocket through the main server so remote clients
+  // (via localtunnel) can access ttyd without needing direct port access.
+
+  function buildTtydInject(ttydPort: number): string {
+    return `<script>
+(function(){
+  window.__ttydPort = '${ttydPort}';
+  var OrigWS = window.WebSocket;
+  window.WebSocket = function(url, protocols) {
+    if (/ws[s]?:\\/\\/[^/]+\\/ws/.test(url)) {
+      url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ttyd-ws/' + window.__ttydPort;
+    }
+    return new OrigWS(url, protocols);
+  };
+})();
+</script>`;
+  }
+
+  // HTTP proxy: /ttyd/:port/* → http://localhost:port/*
+  fastify.all('/ttyd/:port/*', async (req, reply) => {
+    const ttydPort = parseInt((req.params as any).port, 10);
+    if (isNaN(ttydPort) || ttydPort < 1 || ttydPort > 65535) {
+      return reply.code(400).send('Invalid port');
+    }
+    const subPath = req.url.slice(`/ttyd/${ttydPort}`.length) || '/';
+
+    const proxyHeaders: Record<string, string> = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === 'string' && key !== 'host') {
+        proxyHeaders[key] = value;
+      }
+    }
+    proxyHeaders.host = `localhost:${ttydPort}`;
+
+    const options: http.RequestOptions = {
+      hostname: 'localhost',
+      port: ttydPort,
+      path: subPath,
+      method: req.method,
+      headers: proxyHeaders,
+    };
+
+    return new Promise<void>((resolve) => {
+      const proxyReq = http.request(options, (proxyRes) => {
+        const contentType = proxyRes.headers['content-type'] || '';
+        reply.code(proxyRes.statusCode || 200);
+
+        // Copy headers but skip encoding to avoid double-compression issues
+        for (const [key, value] of Object.entries(proxyRes.headers)) {
+          if (key.toLowerCase() !== 'content-encoding' && typeof value === 'string') {
+            reply.header(key, value);
+          }
+        }
+
+        if (contentType.includes('text/html')) {
+          // Inject WebSocket override script into HTML
+          let body = '';
+          proxyRes.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+          proxyRes.on('end', () => {
+            const injected = body.replace('<head>', '<head>' + buildTtydInject(ttydPort));
+            reply.header('content-length', Buffer.byteLength(injected));
+            reply.send(injected);
+            resolve();
+          });
+        } else {
+          proxyRes.pipe(reply.raw);
+          proxyRes.on('end', resolve);
+        }
+      });
+
+      proxyReq.on('error', (err) => {
+        reply.code(502).send('ttyd proxy error: ' + err.message);
+        resolve();
+      });
+
+      if (req.body && typeof req.body !== 'object') {
+        proxyReq.write(req.body);
+      } else if (req.raw) {
+        req.raw.pipe(proxyReq);
+      } else {
+        proxyReq.end();
+      }
+    });
+  });
+
+  // WebSocket proxy: /ttyd-ws/:port → ws://localhost:port/ws
+  fastify.register(async function (fastify) {
+    fastify.get('/ttyd-ws/:port', { websocket: true }, (socket, req) => {
+      const ttydPort = parseInt((req.params as any).port, 10);
+      if (isNaN(ttydPort)) {
+        socket.close();
+        return;
+      }
+
+      // Connect to the local ttyd WebSocket
+      const targetUrl = `ws://localhost:${ttydPort}/ws`;
+      const target = new Ws(targetUrl);
+
+      target.on('open', () => {
+        socket.on('message', (raw: any) => {
+          if (target.readyState === 1) target.send(raw);
+        });
+        socket.on('close', () => {
+          if (target.readyState === 1) target.close();
+        });
+      });
+
+      target.on('message', (data: Buffer) => {
+        if (socket.readyState === 1) socket.send(data);
+      });
+
+      target.on('close', () => {
+        if (socket.readyState === 1) socket.close();
+      });
+
+      target.on('error', (err: Error) => {
+        console.error('[cmux-mobile] ttyd WS proxy error:', err.message);
+        if (socket.readyState === 1) socket.close();
+      });
+    });
   });
 
   // ─── REST API ───
