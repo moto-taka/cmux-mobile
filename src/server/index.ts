@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyWebSocket from '@fastify/websocket';
-import { CmuxSocketClient, resolveCmuxSocketPath } from './cmux-socket.js';
+import { CmuxSocketClient, resolveCmuxSocketPath, type MobileReplay } from './cmux-socket.js';
 import { TtydManager } from './ttyd-manager.js';
 import crypto from 'crypto';
 import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../shared/types.js';
@@ -141,7 +141,11 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   type TerminalStream = {
     interval: ReturnType<typeof setInterval>;
-    lastOutput: string;
+    // The last frame message we broadcast. We dedupe on CONTENT, not on the
+    // replay `seq`: over the local control socket (no data-plane subscriber)
+    // the byte-tee seq stays 0, so seq-based dedupe would freeze the mirror
+    // after the first frame.
+    lastFrame: string;
     viewers: Set<string>;
     workspaceId: string;
     surfaceId: string | null;
@@ -149,24 +153,41 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   };
   const terminalStreams = new Map<string, TerminalStream>();
 
-  // Capture the surface once and push it to every viewer if it changed.
-  async function captureAndBroadcast(stream: TerminalStream) {
-    const output = await cmux.capturePane(stream.workspaceId, stream.surfaceId ?? undefined);
-    if (!output || output === stream.lastOutput) return;
-    stream.lastOutput = output;
-    const data = JSON.stringify({
-      type: 'terminal_output',
-      data: { workspaceId: stream.workspaceId, surfaceId: stream.surfaceId, content: output },
-    });
+  // Turn a replay response into the WS frame message, or null if it had no
+  // renderable content.
+  function buildFrameMessage(stream: TerminalStream, res: MobileReplay | null): string | null {
+    if (!res) return null;
+    const data: Record<string, unknown> = {
+      workspaceId: stream.workspaceId,
+      surfaceId: stream.surfaceId,
+      seq: String(res.seq ?? ''),
+      columns: res.columns,
+      rows: res.rows,
+    };
+    if (res.render_grid) data.renderGrid = res.render_grid;
+    else if (res.snapshot_data_b64) data.vtBase64 = res.snapshot_data_b64;
+    else if (res.data_b64) data.vtBase64 = res.data_b64;
+    else return null;
+    return JSON.stringify({ type: 'terminal_frame', data });
+  }
+
+  // Poll the surface's render-grid and push to viewers only when the rendered
+  // content changed (an idle terminal yields an identical frame → no send).
+  async function replayAndBroadcast(stream: TerminalStream) {
+    const res = await cmux.replayTerminal(stream.workspaceId, stream.surfaceId);
+    if (!res) return;
+    const msg = buildFrameMessage(stream, res);
+    if (!msg || msg === stream.lastFrame) return;
+    stream.lastFrame = msg;
     for (const viewerId of stream.viewers) {
       const client = clients.get(viewerId);
-      if (client?.socket.readyState === 1) client.socket.send(data);
+      if (client?.socket.readyState === 1) client.socket.send(msg);
     }
   }
 
-  // After a viewer sends input, capture immediately instead of waiting for the
-  // next 300ms tick — this is what makes typing feel responsive. The `poking`
-  // flag throttles bursts of keystrokes to one in-flight capture at a time.
+  // After a viewer sends input, replay immediately instead of waiting for the
+  // next tick — this is what makes typing feel responsive. The `poking` flag
+  // throttles bursts of keystrokes to one in-flight replay at a time.
   function pokeTerminalStream(viewerClientId: string) {
     const client = clients.get(viewerClientId);
     if (!client) return;
@@ -175,9 +196,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     const stream = terminalStreams.get(key);
     if (!stream || stream.poking) return;
     stream.poking = true;
-    // Give cmux a beat to apply the input, then capture.
+    // Give cmux a beat to apply the input, then replay.
     setTimeout(() => {
-      captureAndBroadcast(stream).catch(() => {}).finally(() => { stream.poking = false; });
+      replayAndBroadcast(stream).catch(() => {}).finally(() => { stream.poking = false; });
     }, 40);
   }
 
@@ -188,9 +209,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     if (!stream) {
       const created: TerminalStream = {
         interval: setInterval(() => {
-          captureAndBroadcast(created).catch(() => {});
+          replayAndBroadcast(created).catch(() => {});
         }, 300),
-        lastOutput: '',
+        lastFrame: '',
         viewers: new Set(),
         workspaceId,
         surfaceId,
@@ -202,15 +223,16 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
     stream.viewers.add(viewerClientId);
 
-    // Send initial snapshot immediately
-    cmux.capturePane(workspaceId, surfaceId ?? undefined).then((output) => {
-      if (output && stream) {
-        stream.lastOutput = output;
-        const client = clients.get(viewerClientId);
-        if (client?.socket.readyState === 1) {
-          client.socket.send(JSON.stringify({ type: 'terminal_attached', data: { workspaceId, surfaceId } }));
-          client.socket.send(JSON.stringify({ type: 'terminal_output', data: { workspaceId, surfaceId, content: output } }));
-        }
+    // Send the current frame to the (possibly new) viewer immediately.
+    const attached = stream;
+    cmux.replayTerminal(workspaceId, surfaceId).then((res) => {
+      const client = clients.get(viewerClientId);
+      if (!client || client.socket.readyState !== 1) return;
+      client.socket.send(JSON.stringify({ type: 'terminal_attached', data: { workspaceId, surfaceId } }));
+      const msg = buildFrameMessage(attached, res);
+      if (msg) {
+        attached.lastFrame = msg;
+        client.socket.send(msg);
       }
     }).catch(() => {});
 
@@ -288,9 +310,11 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         break;
       }
       case 'terminal_input': {
-        const { surfaceId, data } = msg.data as { surfaceId: string; data: string };
-        if (surfaceId) {
-          await cmux.sendText(surfaceId, data);
+        const { surfaceId, data } = msg.data as { surfaceId: string | null; data: string };
+        if (data) {
+          // mobile.terminal.input (text only — never carries a viewport report,
+          // which would shrink the user's live desktop terminal).
+          await cmux.sendMobileInput(surfaceId ?? null, data);
           pokeTerminalStream(clientId);
         }
         break;

@@ -24,7 +24,7 @@ export interface Surface {
 // ─── Server ↔ Client Messages ───
 
 export interface ServerMessage {
-  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'active_view_change' | 'terminal_output' | 'terminal_attached' | 'error';
+  type: 'workspaces' | 'workspace_update' | 'surface_update' | 'connected' | 'active_view_change' | 'terminal_output' | 'terminal_frame' | 'terminal_attached' | 'error';
   data: unknown;
 }
 

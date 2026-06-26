@@ -24,6 +24,22 @@ interface CmuxSocketClientOptions {
   pollInterval?: number;
 }
 
+/** Response shape of `mobile.terminal.replay`. */
+export interface MobileReplay {
+  workspace_id?: string;
+  surface_id?: string;
+  /** Monotonic change token (UInt64 on the wire — keep as string/number, never compare lossily). */
+  seq?: number | string;
+  columns?: number;
+  rows?: number;
+  /** Primary path: a "cmux.render-grid.v1" frame. */
+  render_grid?: Record<string, unknown>;
+  /** Fallback path when no render grid: base64 VT (ghostty.active.vt) or raw byte-tee. */
+  snapshot_format?: string;
+  snapshot_data_b64?: string;
+  data_b64?: string;
+}
+
 const STATE_DIR = path.join(os.homedir(), '.local/state/cmux');
 const LEGACY_SOCKET_PATH = path.join(os.homedir(), 'Library/Application Support/cmux/cmux.sock');
 
@@ -255,6 +271,37 @@ export class CmuxSocketClient {
 
   async sendKey(surfaceId: string, key: string): Promise<void> {
     await this.request('surface.send_key', { surface_id: surfaceId, key });
+  }
+
+  /**
+   * Send typed input to a terminal surface via the mobile terminal API.
+   * IMPORTANT: deliberately omits client_id / viewport_columns / viewport_rows.
+   * Including those records a *sticky* viewport report that SHRINKS the user's
+   * live desktop terminal (ghostty_surface_set_size + SIGWINCH), persisting
+   * until the connection closes. Text only — never reshape the desktop.
+   */
+  async sendMobileInput(surfaceId: string | null, text: string, workspaceId?: string): Promise<void> {
+    const params: Record<string, unknown> = { text };
+    if (surfaceId) params.surface_id = surfaceId;
+    if (workspaceId) params.workspace_id = workspaceId;
+    await this.request('mobile.terminal.input', params);
+  }
+
+  /**
+   * Cold-attach replay anchor for a terminal surface: a full render-grid frame
+   * (styled cells, cursor, scrollback, alt-screen) at the surface's CURRENT
+   * (desktop) size. Read-only — does not resize the surface. Returns null on
+   * error. `seq` is a monotonic change token used to dedupe identical frames.
+   */
+  async replayTerminal(workspaceId: string, surfaceId?: string | null): Promise<MobileReplay | null> {
+    try {
+      const params: Record<string, unknown> = { workspace_id: workspaceId };
+      if (surfaceId) params.surface_id = surfaceId;
+      const res = await this.request('mobile.terminal.replay', params) as MobileReplay;
+      return res ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

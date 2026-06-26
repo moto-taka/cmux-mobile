@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "tsx src/server/index.ts start",
-    "build": "tsup && rm -rf dist/client dist/shared && cp -r src/client dist/client && mkdir -p dist/shared && cp src/shared/types.ts dist/shared/types.ts && find dist -name .DS_Store -delete && node build-sw-cache.mjs",
+    "build": "tsup && rm -rf dist/client dist/shared && cp -r src/client dist/client && mkdir -p dist/shared && cp src/shared/types.ts dist/shared/types.ts && find dist -name .DS_Store -delete && find dist/client -name '*.test.*' -delete && node build-sw-cache.mjs",
     "start": "node dist/server/index.js start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

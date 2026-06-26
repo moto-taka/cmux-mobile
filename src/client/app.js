@@ -20,7 +20,9 @@
   let term = null; // xterm.js Terminal instance
   let fitAddon = null; // xterm.js FitAddon instance (sizes term to the device)
   let terminalAttached = false;
-  let latestContent = '';   // most recent capture-pane snapshot
+  let latestFrameWrite = null; // most recent VT to paint (string | Uint8Array)
+  let latestCols = 0, latestRows = 0; // grid size of the latest frame
+  let lastGridCols = 0;        // last column count we auto-fit the font to
   let renderPaused = false; // pause repaint during an active scroll gesture
   // Track if user manually scrolled up — pause auto-scroll while browsing history
   let userScrolledUp = false;
@@ -165,7 +167,9 @@
 
     // Resize handling
     const resizeObserver = new ResizeObserver(() => {
-      fitTerminal();
+      // Container size changed (rotation / keyboard) — re-fit the font to the
+      // new width and repaint the current frame.
+      if (latestFrameWrite != null) { lastGridCols = 0; renderFrame(); }
     });
     resizeObserver.observe(terminalContainer);
 
@@ -192,7 +196,7 @@
       const newSize = Math.round(pinchStartFontSize * scale);
       const clamped = Math.max(8, Math.min(32, newSize));
       term.options.fontSize = clamped;
-      fitTerminal();
+      // Pinch is a manual zoom; the grid drives column count, so do NOT re-fit.
     }, { passive: false });
 
     terminalContainer.addEventListener('touchend', (e) => {
@@ -289,9 +293,9 @@
       // Start momentum scroll if velocity is significant
       if (Math.abs(scrollVelocity) > 0.01) {
         startScrollMomentum(scrollVelocity);
-      } else if (!userScrolledUp && latestContent) {
-        // Settled at the bottom — catch up to the latest snapshot
-        renderContent(latestContent);
+      } else if (!userScrolledUp && latestFrameWrite != null) {
+        // Settled at the bottom — catch up to the latest frame
+        renderFrame();
       }
     }, { passive: true });
 
@@ -607,16 +611,15 @@
         break;
       case 'terminal_attached':
         console.log('[cmux] Terminal stream attached');
-        latestContent = '';
+        latestFrameWrite = null;
+        lastGridCols = 0;
         userScrolledUp = false;
         renderPaused = false;
-        if (term) {
-          term.write('\x1b[2J\x1b[3J\x1b[H');
-          fitTerminal();
-        }
+        // Clear now; the first render-grid frame (RIS) repaints from scratch.
+        if (term) term.write('\x1b[2J\x1b[3J\x1b[H');
         break;
-      case 'terminal_output':
-        handleTerminalOutput(msg.data);
+      case 'terminal_frame':
+        handleTerminalFrame(msg.data);
         break;
       case 'active_view_change': {
         const change = msg.data;
@@ -649,33 +652,70 @@
     }
   }
 
-  function handleTerminalOutput(data) {
-    if (!term) {
-      initTerminal();
+  const CHAR_ASPECT = 0.6; // monospace advance width ÷ font-size (≈ Menlo)
+
+  // A cmux render-grid frame (or a base64 VT fallback) → paint into xterm.
+  function handleTerminalFrame(data) {
+    if (!term) initTerminal();
+    if (!term) return;
+
+    let write = null;
+    if (data.renderGrid) {
+      const vt = (typeof renderGridToVT === 'function') ? renderGridToVT(data.renderGrid) : '';
+      if (vt) write = vt;
+      latestCols = (data.columns || data.renderGrid.columns) | 0;
+      latestRows = (data.rows || data.renderGrid.rows) | 0;
+    } else if (data.vtBase64) {
+      try { write = b64ToBytes(data.vtBase64); } catch (_) { write = null; }
+      latestCols = data.columns | 0;
+      latestRows = data.rows | 0;
     }
-    if (!term || !data.content) return;
+    if (write == null) return;
 
-    // Remember the latest snapshot so we can repaint it once the user
-    // finishes scrolling / returns to the bottom.
-    latestContent = data.content;
-
-    // Pause repaint while the user is actively scrolling or reading history —
-    // otherwise the full-clear redraw would yank them back to the bottom.
+    latestFrameWrite = write;
+    // Pause repaint while the user is actively scrolling / reading history.
     if (renderPaused || userScrolledUp) return;
-
-    renderContent(latestContent);
+    renderFrame();
   }
 
-  // Repaint the whole screen from a capture-pane snapshot.
-  // Crucially clears BOTH the screen (2J) and the scrollback (3J) before
-  // writing, so each 300ms frame REPLACES the previous one instead of pushing
-  // another ~200 lines into history — the duplicate accumulation that made
-  // scrolling unusable.
-  function renderContent(content) {
-    if (!term || !content) return;
-    term.write('\x1b[2J\x1b[3J\x1b[H');
-    term.write(content);
-    if (term.scrollToBottom) term.scrollToBottom();
+  function renderFrame() {
+    if (!term || latestFrameWrite == null) return;
+    applyGridGeometry(latestCols, latestRows);
+    // A full render-grid frame begins with RIS (\x1bc), so it self-clears —
+    // no manual wipe, and no duplicate-scrollback accumulation.
+    term.write(latestFrameWrite);
+  }
+
+  // Size the xterm grid to the desktop terminal's grid (so absolute cursor
+  // positioning in the frame is never clipped), and — only when the column
+  // count changes — auto-scale the font so the full width fits the device.
+  function applyGridGeometry(cols, rows) {
+    if (!term || !cols || !rows) return;
+    if (cols !== lastGridCols) {
+      lastGridCols = cols;
+      autoFitFont(cols);
+    }
+    if (term.cols !== cols || term.rows !== rows) {
+      try { term.resize(cols, rows); } catch (_) { /* transient */ }
+    }
+  }
+
+  function autoFitFont(cols) {
+    const avail = terminalContainer.clientWidth - 8; // minus container padding
+    if (avail <= 0 || cols <= 0) return;
+    let fs = Math.floor(avail / (cols * CHAR_ASPECT));
+    fs = Math.max(6, Math.min(fs, 20));
+    if (fs !== term.options.fontSize) {
+      term.options.fontSize = fs;
+      localStorage.setItem('cmux-font-size', String(fs));
+    }
+  }
+
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
   }
 
   function applyWorkspaceUpdate(updated) {
@@ -1096,8 +1136,8 @@
       root.style.setProperty('--term-bottom', 'calc(var(--extra-keys-height) + var(--safe-bottom))');
     }
 
-    // Re-fit xterm to new dimensions (keyboard show/hide)
-    fitTerminal();
+    // Keyboard show/hide changed the container; repaint the current frame.
+    if (latestFrameWrite != null) renderFrame();
   }
 
   if (window.visualViewport) {
