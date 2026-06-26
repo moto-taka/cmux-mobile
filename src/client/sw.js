@@ -1,7 +1,7 @@
 // cmux-mobile Service Worker
 // Cache-first for static assets, network-first for API calls
 
-const CACHE_NAME = 'cmux-v1';
+const CACHE_NAME = 'cmux-v2';
 const PRECACHE_URLS = [
   '/',
   '/index.html',
@@ -32,35 +32,28 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Fetch: cache-first for static, network-first for API
+// Fetch: network-first for the whole same-origin app shell so updated client
+// code/UI is picked up immediately; the cache is only a last-resort offline
+// fallback. (The old cache-first strategy served stale app.js/index.html and
+// hid client fixes until the cache name happened to change.)
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Don't cache ttyd (different port) or WebSocket
-  if (url.port !== location.port || url.protocol === 'ws:' || url.protocol === 'wss:') {
+  // Only handle same-origin GETs. Cross-origin CDN assets (xterm, addon-fit),
+  // the ttyd port, and WebSocket upgrades all pass straight through.
+  if (url.origin !== location.origin || event.request.method !== 'GET') {
     return;
   }
 
-  // API calls: network-first
-  if (url.pathname.startsWith('/api/')) {
-    event.respondWith(
-      fetch(event.request).catch(() => caches.match(event.request))
-    );
-    return;
-  }
-
-  // Static assets: cache-first
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((response) => {
-        // Cache successful GET responses
-        if (response.ok && event.request.method === 'GET') {
+    fetch(event.request)
+      .then((response) => {
+        if (response.ok) {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
         return response;
-      });
-    })
+      })
+      .catch(() => caches.match(event.request))
   );
 });

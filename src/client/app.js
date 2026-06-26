@@ -18,7 +18,12 @@
   let clientId = null;
   let isApplyingRemoteChange = false;
   let term = null; // xterm.js Terminal instance
+  let fitAddon = null; // xterm.js FitAddon instance (sizes term to the device)
   let terminalAttached = false;
+  let latestContent = '';   // most recent capture-pane snapshot
+  let renderPaused = false; // pause repaint during an active scroll gesture
+  // Track if user manually scrolled up — pause auto-scroll while browsing history
+  let userScrolledUp = false;
 
   // Pinch-zoom state
   let pinchStartDistance = 0;
@@ -79,6 +84,15 @@
     return fs * 1.2;
   }
 
+  // Resize the xterm grid (cols/rows) to the current container size.
+  // Requires FitAddon — without it the terminal is stuck at the default 80x24.
+  function fitTerminal() {
+    if (!term || !fitAddon) return;
+    try {
+      fitAddon.fit();
+    } catch (_) { /* container may have zero size mid-transition */ }
+  }
+
   // ─── Terminal (xterm.js) ───
 
   function initTerminal() {
@@ -123,7 +137,15 @@
       convertEol: true,
     });
 
+    if (typeof FitAddon !== 'undefined' && FitAddon.FitAddon) {
+      fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+    } else {
+      console.warn('[cmux] FitAddon not loaded — terminal will not resize to device');
+    }
+
     term.open(terminalContainer);
+    fitTerminal();
 
     // Send user input to cmux via server
     term.onData((data) => {
@@ -144,7 +166,7 @@
 
     // Resize handling
     const resizeObserver = new ResizeObserver(() => {
-      if (term) term.fit && term.fit();
+      fitTerminal();
     });
     resizeObserver.observe(terminalContainer);
 
@@ -171,7 +193,7 @@
       const newSize = Math.round(pinchStartFontSize * scale);
       const clamped = Math.max(8, Math.min(32, newSize));
       term.options.fontSize = clamped;
-      if (term.fit) term.fit();
+      fitTerminal();
     }, { passive: false });
 
     terminalContainer.addEventListener('touchend', (e) => {
@@ -186,6 +208,7 @@
       if (e.touches.length !== 1) return;
 
       cancelScrollMomentum();
+      renderPaused = true; // don't repaint under the user's finger
       const touch = e.touches[0];
       scrollTouchId = touch.identifier;
       scrollLastY = touch.clientY;
@@ -262,10 +285,14 @@
       if (touch.identifier !== scrollTouchId) return;
 
       scrollTouchId = null;
+      renderPaused = false; // finger up — repaints may resume
 
       // Start momentum scroll if velocity is significant
       if (Math.abs(scrollVelocity) > 0.01) {
         startScrollMomentum(scrollVelocity);
+      } else if (!userScrolledUp && latestContent) {
+        // Settled at the bottom — catch up to the latest snapshot
+        renderContent(latestContent);
       }
     }, { passive: true });
 
@@ -274,8 +301,14 @@
       longPressTimer = null;
       isLongPressing = false;
       scrollTouchId = null;
+      renderPaused = false;
       cancelScrollMomentum();
     }, { passive: true });
+
+    // Tap to focus → brings up the mobile soft keyboard
+    terminalContainer.addEventListener('click', () => {
+      if (term) term.focus();
+    });
 
     return term;
   }
@@ -402,10 +435,8 @@
       initTerminal();
     }
     if (term) {
-      // Resize to fit container
-      setTimeout(() => {
-        if (term && term.fit) term.fit();
-      }, 100);
+      // Resize to fit container (after layout settles)
+      setTimeout(fitTerminal, 100);
     }
   }
 
@@ -577,7 +608,13 @@
         break;
       case 'terminal_attached':
         console.log('[cmux] Terminal stream attached');
-        if (term) term.clear();
+        latestContent = '';
+        userScrolledUp = false;
+        renderPaused = false;
+        if (term) {
+          term.write('\x1b[2J\x1b[3J\x1b[H');
+          fitTerminal();
+        }
         break;
       case 'terminal_output':
         handleTerminalOutput(msg.data);
@@ -613,29 +650,33 @@
     }
   }
 
-  // Track if user manually scrolled up — pause auto-scroll while browsing history
-  let userScrolledUp = false;
-
   function handleTerminalOutput(data) {
     if (!term) {
       initTerminal();
     }
     if (!term || !data.content) return;
 
-    // Write the captured terminal content
-    // Use cursor home + content + clear to end for clean redraw
-    const content = data.content;
-    if (content) {
-      // Clear and rewrite — capture-pane gives full screen content
-      term.write('\x1b[H'); // Cursor home
-      term.write(content);
-      term.write('\x1b[J'); // Clear from cursor to end of screen
+    // Remember the latest snapshot so we can repaint it once the user
+    // finishes scrolling / returns to the bottom.
+    latestContent = data.content;
 
-      // Auto-scroll to bottom unless user is browsing scrollback
-      if (!userScrolledUp && term.scrollToBottom) {
-        term.scrollToBottom();
-      }
-    }
+    // Pause repaint while the user is actively scrolling or reading history —
+    // otherwise the full-clear redraw would yank them back to the bottom.
+    if (renderPaused || userScrolledUp) return;
+
+    renderContent(latestContent);
+  }
+
+  // Repaint the whole screen from a capture-pane snapshot.
+  // Crucially clears BOTH the screen (2J) and the scrollback (3J) before
+  // writing, so each 300ms frame REPLACES the previous one instead of pushing
+  // another ~200 lines into history — the duplicate accumulation that made
+  // scrolling unusable.
+  function renderContent(content) {
+    if (!term || !content) return;
+    term.write('\x1b[2J\x1b[3J\x1b[H');
+    term.write(content);
+    if (term.scrollToBottom) term.scrollToBottom();
   }
 
   function applyWorkspaceUpdate(updated) {
@@ -1055,10 +1096,8 @@
       terminalArea.style.paddingBottom = '';
     }
 
-    // Re-fit xterm to new dimensions
-    if (term && term.fit) {
-      try { term.fit(); } catch (_) { /* ignore fit errors during transition */ }
-    }
+    // Re-fit xterm to new dimensions (keyboard show/hide)
+    fitTerminal();
   }
 
   if (window.visualViewport) {

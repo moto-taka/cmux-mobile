@@ -24,7 +24,35 @@ interface CmuxSocketClientOptions {
   pollInterval?: number;
 }
 
-const DEFAULT_SOCKET_PATH = path.join(os.homedir(), 'Library/Application Support/cmux/cmux.sock');
+const STATE_DIR = path.join(os.homedir(), '.local/state/cmux');
+const LEGACY_SOCKET_PATH = path.join(os.homedir(), 'Library/Application Support/cmux/cmux.sock');
+
+/**
+ * Resolve the cmux Unix socket path the way the cmux CLI does, so we always
+ * talk to the *live* app rather than a stale socket left over from a previous
+ * launch:
+ *   1. CMUX_SOCKET_PATH env override
+ *   2. ~/.local/state/cmux/last-socket-path (pointer the running app writes)
+ *   3. ~/.local/state/cmux/cmux.sock
+ *   4. legacy ~/Library/Application Support/cmux/cmux.sock
+ */
+export function resolveCmuxSocketPath(): string {
+  const fromEnv = process.env.CMUX_SOCKET_PATH;
+  if (fromEnv) return fromEnv;
+
+  try {
+    const pointer = fs.readFileSync(path.join(STATE_DIR, 'last-socket-path'), 'utf8').trim();
+    if (pointer && fs.existsSync(pointer)) return pointer;
+  } catch {
+    // no pointer file — fall through
+  }
+
+  const stateSock = path.join(STATE_DIR, 'cmux.sock');
+  if (fs.existsSync(stateSock)) return stateSock;
+
+  return LEGACY_SOCKET_PATH;
+}
+
 const RECONNECT_BASE_DELAY = 3000;
 const MAX_RECONNECT_DELAY = 30000;
 const REQUEST_TIMEOUT = 10000;
@@ -48,7 +76,7 @@ export class CmuxSocketClient {
   private readonly branchCache = new Map<string, { branch: string | undefined; ts: number }>();
 
   constructor(options: CmuxSocketClientOptions = {}) {
-    this.socketPath = options.socketPath ?? process.env.CMUX_SOCKET_PATH ?? DEFAULT_SOCKET_PATH;
+    this.socketPath = options.socketPath ?? resolveCmuxSocketPath();
     this.pollInterval = options.pollInterval ?? 2000;
 
     this.rpcClient = new JSONRPCClient<void>((payload) => {

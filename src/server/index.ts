@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyWebSocket from '@fastify/websocket';
-import { CmuxSocketClient } from './cmux-socket.js';
+import { CmuxSocketClient, resolveCmuxSocketPath } from './cmux-socket.js';
 import { TtydManager } from './ttyd-manager.js';
 import crypto from 'crypto';
 import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../shared/types.js';
@@ -20,7 +20,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   const fullConfig: ServerConfig = {
     port: config.port ?? 3456,
     host: config.host ?? '0.0.0.0',
-    socketPath: config.socketPath ?? process.env.CMUX_SOCKET_PATH ?? join(os.homedir(), 'Library/Application Support/cmux/cmux.sock'),
+    socketPath: config.socketPath ?? resolveCmuxSocketPath(),
     ttydBasePort: config.ttydBasePort ?? 9001,
     tunnel: config.tunnel ?? true,
   };
@@ -139,46 +139,64 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── Terminal Mirror (cmux capture-pane → browser) ───
 
-  const terminalStreams = new Map<string, {
+  type TerminalStream = {
     interval: ReturnType<typeof setInterval>;
     lastOutput: string;
     viewers: Set<string>;
     workspaceId: string;
     surfaceId: string | null;
-  }>();
+    poking: boolean;
+  };
+  const terminalStreams = new Map<string, TerminalStream>();
+
+  // Capture the surface once and push it to every viewer if it changed.
+  async function captureAndBroadcast(stream: TerminalStream) {
+    const output = await cmux.capturePane(stream.workspaceId, stream.surfaceId ?? undefined);
+    if (!output || output === stream.lastOutput) return;
+    stream.lastOutput = output;
+    const data = JSON.stringify({
+      type: 'terminal_output',
+      data: { workspaceId: stream.workspaceId, surfaceId: stream.surfaceId, content: output },
+    });
+    for (const viewerId of stream.viewers) {
+      const client = clients.get(viewerId);
+      if (client?.socket.readyState === 1) client.socket.send(data);
+    }
+  }
+
+  // After a viewer sends input, capture immediately instead of waiting for the
+  // next 300ms tick — this is what makes typing feel responsive. The `poking`
+  // flag throttles bursts of keystrokes to one in-flight capture at a time.
+  function pokeTerminalStream(viewerClientId: string) {
+    const client = clients.get(viewerClientId);
+    if (!client) return;
+    const key = (client as any).__terminalStreamKey;
+    if (!key) return;
+    const stream = terminalStreams.get(key);
+    if (!stream || stream.poking) return;
+    stream.poking = true;
+    // Give cmux a beat to apply the input, then capture.
+    setTimeout(() => {
+      captureAndBroadcast(stream).catch(() => {}).finally(() => { stream.poking = false; });
+    }, 40);
+  }
 
   function startTerminalStream(viewerClientId: string, workspaceId: string, surfaceId: string | null) {
     const key = `${workspaceId}:${surfaceId ?? 'active'}`;
 
     let stream = terminalStreams.get(key);
     if (!stream) {
-      stream = {
-        interval: setInterval(async () => {
-          if (!stream) return;
-          try {
-            const output = await cmux.capturePane(workspaceId, surfaceId ?? undefined);
-            if (output && output !== stream.lastOutput) {
-              if (!stream.lastOutput) {
-                console.log(`   [mirror] First capture for ${workspaceId}, ${output.length} bytes`);
-              }
-              stream.lastOutput = output;
-              const data = JSON.stringify({ type: 'terminal_output', data: { workspaceId, surfaceId, content: output } });
-              for (const viewerId of stream.viewers) {
-                const client = clients.get(viewerId);
-                if (client?.socket.readyState === 1) {
-                  client.socket.send(data);
-                }
-              }
-            }
-          } catch {
-            // cmux not available — skip this tick
-          }
+      const created: TerminalStream = {
+        interval: setInterval(() => {
+          captureAndBroadcast(created).catch(() => {});
         }, 300),
         lastOutput: '',
         viewers: new Set(),
         workspaceId,
         surfaceId,
+        poking: false,
       };
+      stream = created;
       terminalStreams.set(key, stream);
     }
 
@@ -273,6 +291,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         const { surfaceId, data } = msg.data as { surfaceId: string; data: string };
         if (surfaceId) {
           await cmux.sendText(surfaceId, data);
+          pokeTerminalStream(clientId);
         }
         break;
       }
