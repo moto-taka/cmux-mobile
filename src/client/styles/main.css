@@ -28,6 +28,9 @@
   --safe-left: env(safe-area-inset-left, 0px);
   --safe-right: env(safe-area-inset-right, 0px);
   --extra-keys-height: 44px;
+  /* Space the terminal must leave at the bottom for the extra-keys bar
+     (plus the home-indicator safe area). JS bumps this when the keyboard shows. */
+  --term-bottom: calc(var(--extra-keys-height) + var(--safe-bottom));
 }
 
 html, body {
@@ -311,7 +314,6 @@ ul {
   flex: 1;
   position: relative;
   overflow: hidden;
-  padding-bottom: var(--extra-keys-height);
 }
 
 .ttyd-frame {
@@ -325,7 +327,13 @@ ul {
 
 .terminal-container {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* Stop above the extra-keys bar (and keyboard) so the bottom row is never
+     hidden behind it. Driven by --term-bottom, which JS updates on keyboard
+     show/hide. */
+  bottom: var(--term-bottom);
   background: #1e1e2e;
   padding: 4px;
 }
@@ -656,7 +664,9 @@ button:focus-visible {
   bottom: 0;
   left: 0;
   right: 0;
-  height: var(--extra-keys-height);
+  /* Height comes from the 36px buttons + padding (incl. the home-indicator
+     safe area) so the row is never clipped on notched devices. */
+  min-height: var(--extra-keys-height);
   background: var(--bg-header);
   border-top: 1px solid var(--border);
   display: flex;

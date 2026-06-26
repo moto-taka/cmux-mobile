@@ -62,7 +62,6 @@
   const infoContent = $('#info-content');
   const surfaceTabs = $('#surface-tabs');
   const terminalContainer = $('#terminal-container');
-  const terminalArea = $('.terminal-area');
   const loadingScreen = $('#loading-screen');
   const errorScreen = $('#error-screen');
   const retryBtn = $('#retry-btn');
@@ -1085,15 +1084,16 @@
     // Keyboard height: the portion of the window covered by the software keyboard
     const keyboardHeight = Math.max(0, innerHeight - vv.height - vv.offsetTop);
 
+    const root = document.documentElement;
     if (keyboardHeight > 0) {
-      // Keyboard is visible — move extra-keys-bar above the keyboard
+      // Keyboard visible — float the extra-keys bar just above it, and lift the
+      // terminal above BOTH the keyboard and the bar.
       extraKeysBar.style.bottom = keyboardHeight + 'px';
-      // Adjust terminal area padding to account for toolbar + keyboard gap
-      terminalArea.style.paddingBottom = 'var(--extra-keys-height)';
+      root.style.setProperty('--term-bottom', `calc(${keyboardHeight}px + var(--extra-keys-height) + var(--safe-bottom))`);
     } else {
-      // Keyboard hidden — restore defaults
+      // Keyboard hidden — bar rests at the bottom; terminal sits above the bar.
       extraKeysBar.style.bottom = '';
-      terminalArea.style.paddingBottom = '';
+      root.style.setProperty('--term-bottom', 'calc(var(--extra-keys-height) + var(--safe-bottom))');
     }
 
     // Re-fit xterm to new dimensions (keyboard show/hide)
