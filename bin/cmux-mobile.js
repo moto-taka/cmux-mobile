@@ -109,7 +109,10 @@ async function doUp() {
     return;
   }
   const fwd = args.slice(1);
-  const wantTunnel = !fwd.includes('--no-tunnel'); // Cloudflare tunnel on by default
+  // LAN by default (reliable on the same Wi-Fi). Opt into the Cloudflare tunnel
+  // with `up --tunnel`.
+  if (!fwd.includes('--tunnel')) fwd.push('--no-tunnel');
+  const wantTunnel = fwd.includes('--tunnel');
 
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(STATE_DIR, 0o700); } catch { /* ignore */ }
@@ -160,7 +163,7 @@ Foreground:
   cmux-mobile start [options]    Run in this terminal (Ctrl-C to stop)
 
 Background (frees the terminal):
-  cmux-mobile up [options]       Start detached (Cloudflare tunnel on by default)
+  cmux-mobile up [options]       Start detached (LAN only; add --tunnel for Cloudflare)
   cmux-mobile down               Stop the background server
   cmux-mobile restart [options]  Restart the background server
   cmux-mobile status             Show running state + URL

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import qrcode from 'qrcode-terminal';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -35,6 +35,34 @@ function loadOrCreateToken(): string {
     // state dir not writable — fall back to an ephemeral token
   }
   return token;
+}
+
+// Order LAN IPv4s so the QR/URL uses the address a phone on the same Wi-Fi can
+// actually reach: the default-route interface first (the real Wi-Fi/Ethernet),
+// then other private LANs, then Tailscale/CGNAT, then anything else. A Mac often
+// has several IPv4s (Wi-Fi, VPN, Tailscale, virtual bridges) and picking a
+// virtual one yields a QR that just spins on "Connecting".
+function orderedLanIps(): string[] {
+  const all: { iface: string; ip: string }[] = [];
+  for (const [iface, addrs] of Object.entries(os.networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family === 'IPv4' && !a.internal) all.push({ iface, ip: a.address });
+    }
+  }
+  let primary: string | null = null;
+  try {
+    const out = execFileSync('/sbin/route', ['-n', 'get', 'default'], { encoding: 'utf8', timeout: 2000 });
+    primary = out.match(/interface:\s*(\S+)/)?.[1] ?? null;
+  } catch {
+    // no default route / not macOS
+  }
+  const score = (e: { iface: string; ip: string }): number => {
+    if (primary && e.iface === primary) return 0;
+    if (/^(192\.168|10\.|172\.(1[6-9]|2\d|3[01]))\./.test(e.ip)) return 1;
+    if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(e.ip)) return 3; // Tailscale CGNAT
+    return 2;
+  };
+  return all.sort((a, b) => score(a) - score(b)).map((e) => e.ip);
 }
 
 // Resolve cloudflared by absolute path. When launched from the .app, the server
@@ -433,17 +461,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   await fastify.listen({ port: fullConfig.port, host: fullConfig.host });
 
-  // Show access URLs
-  const nets = os.networkInterfaces();
-  const ips: string[] = [];
-  for (const iface of Object.values(nets)) {
-    if (!iface) continue;
-    for (const addr of iface) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        ips.push(addr.address);
-      }
-    }
-  }
+  // Show access URLs (best LAN IP first).
+  const ips = orderedLanIps();
 
   // Persist access info so `cmux-mobile url`/`qr` (and background launchers) can
   // surface the URL without scraping stdout. Embeds the token, so it is a
