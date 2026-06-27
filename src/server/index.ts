@@ -2,12 +2,12 @@ import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
 import fastifyWebSocket from '@fastify/websocket';
 import { CmuxSocketClient, resolveCmuxSocketPath, type MobileReplay } from './cmux-socket.js';
-import { TtydManager } from './ttyd-manager.js';
 import crypto from 'crypto';
 import type { ServerConfig, Workspace, ServerMessage, ClientMessage } from '../shared/types.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
+import fs from 'node:fs';
 import qrcode from 'qrcode-terminal';
 import localtunnel from 'localtunnel';
 
@@ -15,6 +15,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const CLIENT_DIR = join(__dirname, '..', 'client');
+const STATE_DIR = join(os.homedir(), '.local/state/cmux-mobile');
+
+// Persist the access token so the phone URL stays stable across restarts —
+// essential once the server runs in the background (you bookmark it once).
+function loadOrCreateToken(): string {
+  const tokenPath = join(STATE_DIR, 'token');
+  try {
+    const existing = fs.readFileSync(tokenPath, 'utf8').trim();
+    if (existing) return existing;
+  } catch {
+    // none yet
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(tokenPath, token, { mode: 0o600 });
+  } catch {
+    // state dir not writable — fall back to an ephemeral token
+  }
+  return token;
+}
 
 export async function createServer(config: Partial<ServerConfig> = {}) {
   const fullConfig: ServerConfig = {
@@ -25,10 +46,9 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     tunnel: config.tunnel ?? true,
   };
 
-  const accessToken = crypto.randomBytes(16).toString('hex');
+  const accessToken = loadOrCreateToken();
 
   const cmux = new CmuxSocketClient({ socketPath: fullConfig.socketPath });
-  const ttyd = new TtydManager(fullConfig.ttydBasePort);
   const clients = new Map<string, { socket: any; clientId: string; currentWorkspaceId: string | null; currentSurfaceId: string | null }>();
   let workspaces: Workspace[] = [];
 
@@ -326,17 +346,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   async function refreshWorkspaces() {
     try {
-      const wsList: Workspace[] = await cmux.listWorkspaces() as Workspace[];
-
-      await ttyd.syncWorkspaces(
-        wsList.map((w: Workspace) => ({ id: w.id, cwd: w.cwd, name: w.name }))
-      );
-
-      workspaces = wsList.map((w: Workspace) => {
-        const info = ttyd.getInfo(w.id);
-        return { ...w, ttydPort: info?.port };
-      });
-
+      workspaces = await cmux.listWorkspaces() as Workspace[];
       broadcast({ type: 'workspaces', data: workspaces });
     } catch {
       // cmux not available — will retry on next poll
@@ -344,18 +354,8 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   }
 
   // Listen for cmux polling updates
-  cmux.on('workspace_changed', async (wsList: unknown) => {
-    const list = (wsList as Workspace[]) ?? [];
-
-    await ttyd.syncWorkspaces(
-      list.map((w) => ({ id: w.id, cwd: w.cwd, name: w.name }))
-    ).catch(() => {});
-
-    workspaces = list.map((w: Workspace) => {
-      const info = ttyd.getInfo(w.id);
-      return { ...w, ttydPort: info?.port };
-    });
-
+  cmux.on('workspace_changed', (wsList: unknown) => {
+    workspaces = (wsList as Workspace[]) ?? [];
     broadcast({ type: 'workspaces', data: workspaces });
   });
 
@@ -395,8 +395,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   }
   console.log(`   Token:  ${accessToken}\n`);
 
-  await ttyd.start();
-
   try {
     await cmux.connect();
     console.log('   ✓ Connected to cmux socket');
@@ -430,6 +428,21 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         ips.push(addr.address);
       }
     }
+  }
+
+  // Persist access info so `cmux-mobile url` (and background launchers) can
+  // surface the URL without scraping stdout.
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(join(STATE_DIR, 'access.json'), JSON.stringify({
+      token: accessToken,
+      port: fullConfig.port,
+      pid: process.pid,
+      local: `http://localhost:${fullConfig.port}?token=${accessToken}`,
+      urls: ips.map((ip) => `http://${ip}:${fullConfig.port}?token=${accessToken}`),
+    }, null, 2));
+  } catch {
+    // non-fatal
   }
 
   console.log('\n📱 Access from your phone (same network):');
@@ -483,7 +496,6 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     console.log('\nShutting down...');
     try {
       cmux.disconnect();
-      await ttyd.stop();
       if (tunnel) tunnel.close();
       await fastify.close();
     } catch (err) {
