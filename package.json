@@ -11,6 +11,7 @@
     "build": "tsup && rm -rf dist/client dist/shared && cp -r src/client dist/client && mkdir -p dist/shared && cp src/shared/types.ts dist/shared/types.ts && find dist -name .DS_Store -delete && find dist/client -name '*.test.*' -delete && node build-sw-cache.mjs",
     "start": "node dist/server/index.js start",
     "serve": "npm run build && node bin/cmux-mobile.js up",
+    "build:app": "bash scripts/build-app.sh",
     "up": "node bin/cmux-mobile.js up",
     "down": "node bin/cmux-mobile.js down",
     "restart": "node bin/cmux-mobile.js restart",
