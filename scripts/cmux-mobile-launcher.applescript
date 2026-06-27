@@ -31,19 +31,20 @@ on run
 	try
 		if my isRunning() then
 			set u to my cmuxUrl()
-			set act to button returned of (display dialog "cmux-mobile is running." & return & return & u buttons {"Stop", "Copy URL", "OK"} default button "OK" with title "cmux-mobile")
+			set act to button returned of (display dialog "cmux-mobile is running." & return & return & u buttons {"Stop", "Show QR", "OK"} default button "Show QR" with title "cmux-mobile")
 			if act is "Stop" then
 				my cmuxRun("down")
 				display notification "Stopped." with title "cmux-mobile"
-			else if act is "Copy URL" then
+			else if act is "Show QR" then
 				if u is not "" then set the clipboard to u
-				display notification "Phone URL copied to clipboard." with title "cmux-mobile"
+				my cmuxRun("qr --open")
 			end if
 		else
 			my cmuxRun("up")
 			set u to my cmuxUrl()
 			if u is not "" then set the clipboard to u
-			display notification u with title "cmux-mobile started" subtitle "Phone URL copied to clipboard"
+			my cmuxRun("qr --open")
+			display notification u with title "cmux-mobile started" subtitle "Scan the QR (URL also copied)"
 		end if
 	on error errMsg
 		display dialog "cmux-mobile failed to launch:" & return & return & errMsg buttons {"OK"} default button "OK" with icon caution with title "cmux-mobile"

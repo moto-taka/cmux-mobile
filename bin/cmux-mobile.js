@@ -148,7 +148,8 @@ Background (frees the terminal):
   cmux-mobile down               Stop the background server
   cmux-mobile restart [options]  Restart the background server
   cmux-mobile status             Show running state + URL
-  cmux-mobile url                Print the phone URL + QR code
+  cmux-mobile url                Print the phone URL + ASCII QR
+  cmux-mobile qr [--open]        Save a QR image (and open it in Preview)
   cmux-mobile logs [-f]          Show (or follow) the server log
 
 Options:
@@ -202,6 +203,28 @@ async function main() {
         console.log('');
         qrcode.generate(target, { small: true }, (qr) => console.log(qr));
       } catch { /* qrcode unavailable — text URL is enough */ }
+      break;
+    }
+    case 'qr': {
+      const a = readAccess();
+      if (!a) { console.log('No access info. Start it first:  cmux-mobile up'); break; }
+      const target = (a.urls && a.urls[0]) || a.local;
+      const png = join(STATE_DIR, 'qr.png');
+      try {
+        const { default: QRCode } = await import('qrcode');
+        fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+        await QRCode.toFile(png, target, { width: 512, margin: 2 });
+        // Encodes the token-bearing URL — keep owner-only.
+        try { fs.chmodSync(png, 0o600); } catch { /* ignore */ }
+        console.log(target);
+        console.log(png);
+        if (args.includes('--open') || args.includes('-o')) {
+          spawn('open', [png], { detached: true, stdio: 'ignore' }).unref();
+        }
+      } catch (err) {
+        console.error('Failed to generate QR:', err && err.message ? err.message : err);
+        process.exit(1);
+      }
       break;
     }
     case 'logs': {

@@ -19,7 +19,7 @@
 npm run build:app    # ~/Applications/cmux-mobile.app を生成
 ```
 
-`~/Applications/cmux-mobile.app` を **Finder / Launchpad からダブルクリック**するだけでバックグラウンド起動し、スマホ用URLがクリップボードにコピーされます。もう一度ダブルクリックすると「Stop / Copy URL」を選べます（トグル）。
+`~/Applications/cmux-mobile.app` を **Finder / Launchpad からダブルクリック**するだけでバックグラウンド起動し、**QRコード画像がPreviewで開きます**（スマホのカメラでスキャンして接続）。URLもクリップボードにコピーされます。もう一度ダブルクリックすると「Stop / Show QR」を選べます（トグル）。
 
 > Node のバージョンを変えたりリポジトリを移動したら `npm run build:app` を再実行してください（node とパスを埋め込むため）。初回起動時は通知/オートメーションの許可を求められます。
 
@@ -32,7 +32,8 @@ npm run serve     # ビルドしてバックグラウンド起動（LAN限定）
 # もしくは
 npm run up        # 既存ビルドをバックグラウンド起動
 npm run status    # 稼働状況とURLを表示
-npm run url       # スマホ用URL + QRコードを表示
+npm run url       # スマホ用URL + QR（ターミナル表示）
+node bin/cmux-mobile.js qr --open   # QR画像を生成してPreviewで開く
 npm run down      # 停止
 npm run restart   # 再起動
 node bin/cmux-mobile.js logs -f   # ログ追尾
