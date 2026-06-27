@@ -6,6 +6,7 @@
 
 - Node.js 18+
 - [cmux](https://cmux.com) が起動中でSocket APIが有効
+- 外出先（別ネットワーク）のスマホから使うなら [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)（`brew install cloudflared`）。LAN内だけなら不要。
 
 > ターミナルは cmux の `mobile.terminal.*`（render-grid）を直接ミラーするため、**ttyd は不要**になりました。
 
@@ -21,6 +22,8 @@ npm run build:app    # ~/Applications/cmux-mobile.app を生成
 
 `~/Applications/cmux-mobile.app` を **Finder / Launchpad からダブルクリック**するだけでバックグラウンド起動し、**QRコード画像がPreviewで開きます**（スマホのカメラでスキャンして接続）。URLもクリップボードにコピーされます。もう一度ダブルクリックすると「Stop / Show QR」を選べます（トグル）。
 
+QRが符号化するのは **Cloudflare トンネルの公開URL** なので、スマホがモバイル回線（別ネットワーク）でも繋がります。
+
 > Node のバージョンを変えたりリポジトリを移動したら `npm run build:app` を再実行してください（node とパスを埋め込むため）。初回起動時は通知/オートメーションの許可を求められます。
 
 ### バックグラウンド起動（ターミナルを占有しない）
@@ -28,7 +31,7 @@ npm run build:app    # ~/Applications/cmux-mobile.app を生成
 CLIから常駐させたい場合はこちら。ターミナルを閉じても動き続けます。
 
 ```bash
-npm run serve     # ビルドしてバックグラウンド起動（LAN限定）
+npm run serve     # ビルドしてバックグラウンド起動（Cloudflareトンネル）
 # もしくは
 npm run up        # 既存ビルドをバックグラウンド起動
 npm run status    # 稼働状況とURLを表示
@@ -39,8 +42,8 @@ npm run restart   # 再起動
 node bin/cmux-mobile.js logs -f   # ログ追尾
 ```
 
-- アクセストークンは永続化されるため、**スマホのURLは再起動しても変わりません**（一度ブックマークすればOK）。
-- バックグラウンド既定は **LAN限定**（公開トンネルなし）。公開したい場合は `npm run up -- --tunnel`。
+- バックグラウンド既定で **Cloudflare トンネル（`*.trycloudflare.com`）を自動起動**し、外出先のスマホからもアクセス可。LAN内だけなら `npm run up -- --no-tunnel`。
+- トークンは永続化されますが、**Cloudflare のトンネルURLは起動ごとに変わります**（毎回 QR をスキャンすれば繋がります）。⚠ 公開URL＋トークンを知る人は端末にアクセスできます。
 - 状態・ログ: `~/.local/state/cmux-mobile/`, `~/Library/Logs/cmux-mobile.log`
 
 ### フォアグラウンド起動

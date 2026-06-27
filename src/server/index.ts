@@ -8,8 +8,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import qrcode from 'qrcode-terminal';
-import localtunnel from 'localtunnel';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -35,6 +35,21 @@ function loadOrCreateToken(): string {
     // state dir not writable — fall back to an ephemeral token
   }
   return token;
+}
+
+// Resolve cloudflared by absolute path. When launched from the .app, the server
+// runs with a minimal PATH (/usr/bin:/bin) that omits Homebrew, so `cloudflared`
+// alone would not be found.
+function findCloudflared(): string {
+  const candidates = [
+    '/opt/homebrew/bin/cloudflared',
+    '/usr/local/bin/cloudflared',
+    '/usr/bin/cloudflared',
+  ];
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return c; } catch { /* keep looking */ }
+  }
+  return 'cloudflared'; // last resort: rely on PATH
 }
 
 export async function createServer(config: Partial<ServerConfig> = {}) {
@@ -391,7 +406,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   console.log(`   Socket: ${fullConfig.socketPath}`);
   console.log(`   Port:   ${fullConfig.port}`);
   if (fullConfig.tunnel) {
-    console.log(`   Tunnel: enabled`);
+    console.log(`   Tunnel: Cloudflare`);
   }
   console.log(`   Token:  ${accessToken}\n`);
 
@@ -430,27 +445,31 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     }
   }
 
-  // Persist access info so `cmux-mobile url` (and background launchers) can
-  // surface the URL without scraping stdout. This embeds the access token in
-  // the URLs, so it is a credential file — write it owner-only (0600) in an
-  // owner-only state dir (0700).
-  try {
-    const accessPath = join(STATE_DIR, 'access.json');
-    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    fs.chmodSync(STATE_DIR, 0o700); // tighten even a pre-existing looser dir
-    fs.writeFileSync(accessPath, JSON.stringify({
-      token: accessToken,
-      port: fullConfig.port,
-      pid: process.pid,
-      local: `http://localhost:${fullConfig.port}?token=${accessToken}`,
-      urls: ips.map((ip) => `http://${ip}:${fullConfig.port}?token=${accessToken}`),
-    }, null, 2), { mode: 0o600 });
-    // mode on writeFileSync only applies on creation — enforce 0600 even if an
-    // older, looser-permissioned file already existed.
-    fs.chmodSync(accessPath, 0o600);
-  } catch {
-    // non-fatal
-  }
+  // Persist access info so `cmux-mobile url`/`qr` (and background launchers) can
+  // surface the URL without scraping stdout. Embeds the token, so it is a
+  // credential file — write owner-only (0600) in an owner-only dir (0700).
+  // Rewritten once the Cloudflare tunnel URL is known (see below).
+  const persistAccess = (tunnelUrl: string | null) => {
+    try {
+      const accessPath = join(STATE_DIR, 'access.json');
+      fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+      fs.chmodSync(STATE_DIR, 0o700); // tighten even a pre-existing looser dir
+      fs.writeFileSync(accessPath, JSON.stringify({
+        token: accessToken,
+        port: fullConfig.port,
+        pid: process.pid,
+        tunnel: tunnelUrl,
+        local: `http://localhost:${fullConfig.port}?token=${accessToken}`,
+        urls: ips.map((ip) => `http://${ip}:${fullConfig.port}?token=${accessToken}`),
+      }, null, 2), { mode: 0o600 });
+      // mode on writeFileSync only applies on creation — enforce 0600 even if an
+      // older, looser-permissioned file already existed.
+      fs.chmodSync(accessPath, 0o600);
+    } catch {
+      // non-fatal
+    }
+  };
+  persistAccess(null);
 
   console.log('\n📱 Access from your phone (same network):');
   for (const ip of ips) {
@@ -464,33 +483,45 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   }
   console.log(`   Local: http://localhost:${fullConfig.port}\n`);
 
-  // ─── Tunnel (localtunnel) ───
+  // ─── Tunnel (Cloudflare quick tunnel) ───
+  //
+  // Spawn `cloudflared tunnel --url ...`, which prints a https://<random>.
+  // trycloudflare.com URL (no account needed). We scan its output for that URL,
+  // append the token, persist it to access.json (so `qr`/`url` use the PUBLIC
+  // URL, not the LAN IP), and print a QR.
 
-  let tunnel: localtunnel.Tunnel | null = null;
+  let cfproc: ReturnType<typeof spawn> | null = null;
 
   if (fullConfig.tunnel) {
     try {
-      tunnel = await localtunnel({ port: fullConfig.port });
-      const tunnelUrl = `${tunnel.url}?token=${accessToken}`;
-
-      console.log('🌐 Access from anywhere (public tunnel):');
-      console.log(`   ${tunnelUrl}`);
-      console.log();
-      qrcode.generate(tunnelUrl, { small: true }, (qr: string) => {
-        console.log(qr);
+      cfproc = spawn(
+        findCloudflared(),
+        ['tunnel', '--url', `http://localhost:${fullConfig.port}`, '--no-autoupdate'],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let announced = false;
+      const scan = (buf: Buffer) => {
+        const match = buf.toString().match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (match && !announced) {
+          announced = true;
+          const tunnelUrl = `${match[0]}?token=${accessToken}`;
+          persistAccess(tunnelUrl);
+          console.log('\n🌐 Access from anywhere (Cloudflare tunnel):');
+          console.log(`   ${tunnelUrl}\n`);
+          qrcode.generate(tunnelUrl, { small: true }, (qr: string) => console.log(qr));
+          console.log('   ⚠  Anyone with this URL + token can reach your terminals.\n');
+        }
+      };
+      cfproc.stdout?.on('data', scan);
+      cfproc.stderr?.on('data', scan); // cloudflared prints the URL on stderr
+      cfproc.on('error', (err: Error) => {
+        console.error('[cmux-mobile] cloudflared failed (install it: `brew install cloudflared`):', err.message);
       });
-      console.log();
-      console.log('   ⚠  Share this URL only with trusted devices.\n');
-
-      tunnel.on('close', () => {
-        console.log('[cmux-mobile] Tunnel closed');
-      });
-
-      tunnel.on('error', (err: Error) => {
-        console.error('[cmux-mobile] Tunnel error:', err.message);
+      cfproc.on('exit', (code: number | null) => {
+        if (code) console.error(`[cmux-mobile] cloudflared exited with code ${code}`);
       });
     } catch (err) {
-      console.error('[cmux-mobile] Failed to start tunnel:', err);
+      console.error('[cmux-mobile] Failed to start cloudflared:', err);
     }
   }
 
@@ -503,7 +534,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
     console.log('\nShutting down...');
     try {
       cmux.disconnect();
-      if (tunnel) tunnel.close();
+      if (cfproc) cfproc.kill();
       await fastify.close();
     } catch (err) {
       console.error('Error during shutdown:', err);

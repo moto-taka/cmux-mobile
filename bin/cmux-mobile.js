@@ -67,26 +67,37 @@ function isAlive(pid) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function waitForFreshAccess(timeoutMs = 6000) {
+// Wait for OUR server's access.json (pid match). If a tunnel is expected, keep
+// waiting until the tunnel URL is written (Cloudflare takes a few seconds).
+async function waitForAccess(childPid, wantTunnel) {
   const start = Date.now();
-  let prev = 0;
-  try { prev = fs.statSync(ACCESS_FILE).mtimeMs; } catch { /* none */ }
-  while (Date.now() - start < timeoutMs) {
-    try {
-      if (fs.statSync(ACCESS_FILE).mtimeMs > prev) return readAccess();
-    } catch { /* not yet */ }
-    await sleep(200);
+  const timeout = wantTunnel ? 25000 : 8000;
+  let last = null;
+  while (Date.now() - start < timeout) {
+    const a = readAccess();
+    if (a && a.pid === childPid) {
+      last = a;
+      if (!wantTunnel || a.tunnel) return a;
+    }
+    await sleep(250);
   }
-  return readAccess();
+  return last;
 }
 
 function printUrls(a) {
   if (!a) { console.log('  (no access info yet — check the logs)'); return; }
+  if (a.tunnel) console.log('  Public (Cloudflare): ' + a.tunnel);
   if (a.urls && a.urls.length) {
     console.log('  Phone (same Wi-Fi):');
     for (const u of a.urls) console.log('    ' + u);
   }
   console.log('  Local: ' + (a.local || `http://localhost:${a.port}?token=${a.token}`));
+}
+
+// The best URL to hand to a phone: the public tunnel if up, else a LAN IP.
+function phoneUrl(a) {
+  if (!a) return '';
+  return a.tunnel || (a.urls && a.urls[0]) || a.local || '';
 }
 
 async function doUp() {
@@ -98,8 +109,7 @@ async function doUp() {
     return;
   }
   const fwd = args.slice(1);
-  // Background default: LAN only. Opt into a public tunnel with `up --tunnel`.
-  if (!fwd.includes('--tunnel')) fwd.push('--no-tunnel');
+  const wantTunnel = !fwd.includes('--no-tunnel'); // Cloudflare tunnel on by default
 
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(STATE_DIR, 0o700); } catch { /* ignore */ }
@@ -117,7 +127,8 @@ async function doUp() {
   fs.writeFileSync(PID_FILE, String(child.pid));
 
   console.log(`cmux-mobile started in the background (pid ${child.pid}).`);
-  printUrls(await waitForFreshAccess());
+  if (wantTunnel) console.log('Waiting for the Cloudflare tunnel…');
+  printUrls(await waitForAccess(child.pid, wantTunnel));
   console.log(`\n  Logs: ${LOG_FILE}`);
   console.log('  Stop: cmux-mobile down');
 }
@@ -144,7 +155,7 @@ Foreground:
   cmux-mobile start [options]    Run in this terminal (Ctrl-C to stop)
 
 Background (frees the terminal):
-  cmux-mobile up [options]       Start detached (LAN only by default)
+  cmux-mobile up [options]       Start detached (Cloudflare tunnel on by default)
   cmux-mobile down               Stop the background server
   cmux-mobile restart [options]  Restart the background server
   cmux-mobile status             Show running state + URL
@@ -157,8 +168,8 @@ Options:
   --host <s>            Bind host (default: 0.0.0.0)
   --socket-path <p>     cmux socket path (default: auto-detected)
   --ttyd-base-port <n>  Base port for ttyd (default: 9001)
-  --tunnel              Enable the public tunnel (off by default for 'up')
-  --no-tunnel           Disable the public tunnel
+  --tunnel              Force the Cloudflare tunnel on
+  --no-tunnel           LAN only (no public tunnel)
   --help                Show this help
 
 State:
@@ -198,7 +209,7 @@ async function main() {
       if (!a) { console.log('No access info. Start it first:  cmux-mobile up'); break; }
       printUrls(a);
       try {
-        const target = (a.urls && a.urls[0]) || a.local;
+        const target = phoneUrl(a);
         const { default: qrcode } = await import('qrcode-terminal');
         console.log('');
         qrcode.generate(target, { small: true }, (qr) => console.log(qr));
@@ -208,7 +219,7 @@ async function main() {
     case 'qr': {
       const a = readAccess();
       if (!a) { console.log('No access info. Start it first:  cmux-mobile up'); break; }
-      const target = (a.urls && a.urls[0]) || a.local;
+      const target = phoneUrl(a);
       const png = join(STATE_DIR, 'qr.png');
       try {
         const { default: QRCode } = await import('qrcode');
