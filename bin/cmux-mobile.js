@@ -71,7 +71,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // waiting until the tunnel URL is written (Cloudflare takes a few seconds).
 async function waitForAccess(childPid, wantTunnel) {
   const start = Date.now();
-  const timeout = wantTunnel ? 25000 : 8000;
+  const timeout = wantTunnel ? 12000 : 8000;
   let last = null;
   while (Date.now() - start < timeout) {
     const a = readAccess();
@@ -127,8 +127,13 @@ async function doUp() {
   fs.writeFileSync(PID_FILE, String(child.pid));
 
   console.log(`cmux-mobile started in the background (pid ${child.pid}).`);
-  if (wantTunnel) console.log('Waiting for the Cloudflare tunnel…');
-  printUrls(await waitForAccess(child.pid, wantTunnel));
+  if (wantTunnel) console.log('Waiting for the Cloudflare tunnel to become reachable…');
+  const a = await waitForAccess(child.pid, wantTunnel);
+  printUrls(a);
+  if (wantTunnel && a && !a.tunnel) {
+    console.log('\n  ⚠ Cloudflare tunnel not reachable yet — the QR/URL above is LAN-only for now');
+    console.log('    (works on the same Wi-Fi). Re-run `cmux-mobile qr` later if it comes up.');
+  }
   console.log(`\n  Logs: ${LOG_FILE}`);
   console.log('  Stop: cmux-mobile down');
 }

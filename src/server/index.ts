@@ -499,17 +499,39 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
         ['tunnel', '--url', `http://localhost:${fullConfig.port}`, '--no-autoupdate'],
         { stdio: ['ignore', 'pipe', 'pipe'] },
       );
+      // cloudflared prints the URL immediately, but Cloudflare warns it "may
+      // take some time to be reachable" — and on some networks (e.g. a resolver
+      // that NXDOMAINs trycloudflare) it never resolves. So VERIFY the public
+      // URL actually responds before putting it in access.json / the QR. Until
+      // then `qr`/`url` keep using the LAN URL (which works on the same Wi-Fi),
+      // so the QR never points at a dead URL.
+      const verifyTunnel = async (baseUrl: string) => {
+        const deadline = Date.now() + 90_000;
+        while (Date.now() < deadline) {
+          try {
+            const res = await fetch(baseUrl, { signal: AbortSignal.timeout(5000) });
+            if (res.ok) {
+              const tunnelUrl = `${baseUrl}?token=${accessToken}`;
+              persistAccess(tunnelUrl);
+              console.log('\n🌐 Access from anywhere (Cloudflare tunnel):');
+              console.log(`   ${tunnelUrl}\n`);
+              qrcode.generate(tunnelUrl, { small: true }, (qr: string) => console.log(qr));
+              console.log('   ⚠  Anyone with this URL + token can reach your terminals.\n');
+              return;
+            }
+          } catch {
+            // not reachable yet — keep polling
+          }
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+        console.error(`[cmux-mobile] Cloudflare tunnel (${baseUrl}) never became reachable — the QR/URL falls back to LAN (works on the same Wi-Fi). For remote use, check your DNS/firewall or use Tailscale.`);
+      };
       let announced = false;
       const scan = (buf: Buffer) => {
         const match = buf.toString().match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
         if (match && !announced) {
           announced = true;
-          const tunnelUrl = `${match[0]}?token=${accessToken}`;
-          persistAccess(tunnelUrl);
-          console.log('\n🌐 Access from anywhere (Cloudflare tunnel):');
-          console.log(`   ${tunnelUrl}\n`);
-          qrcode.generate(tunnelUrl, { small: true }, (qr: string) => console.log(qr));
-          console.log('   ⚠  Anyone with this URL + token can reach your terminals.\n');
+          void verifyTunnel(match[0]);
         }
       };
       cfproc.stdout?.on('data', scan);
