@@ -29,7 +29,7 @@ function loadOrCreateToken(): string {
   }
   const token = crypto.randomBytes(16).toString('hex');
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
     fs.writeFileSync(tokenPath, token, { mode: 0o600 });
   } catch {
     // state dir not writable — fall back to an ephemeral token
@@ -431,16 +431,23 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   }
 
   // Persist access info so `cmux-mobile url` (and background launchers) can
-  // surface the URL without scraping stdout.
+  // surface the URL without scraping stdout. This embeds the access token in
+  // the URLs, so it is a credential file — write it owner-only (0600) in an
+  // owner-only state dir (0700).
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(join(STATE_DIR, 'access.json'), JSON.stringify({
+    const accessPath = join(STATE_DIR, 'access.json');
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    fs.chmodSync(STATE_DIR, 0o700); // tighten even a pre-existing looser dir
+    fs.writeFileSync(accessPath, JSON.stringify({
       token: accessToken,
       port: fullConfig.port,
       pid: process.pid,
       local: `http://localhost:${fullConfig.port}?token=${accessToken}`,
       urls: ips.map((ip) => `http://${ip}:${fullConfig.port}?token=${accessToken}`),
-    }, null, 2));
+    }, null, 2), { mode: 0o600 });
+    // mode on writeFileSync only applies on creation — enforce 0600 even if an
+    // older, looser-permissioned file already existed.
+    fs.chmodSync(accessPath, 0o600);
   } catch {
     // non-fatal
   }

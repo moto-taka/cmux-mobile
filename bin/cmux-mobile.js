@@ -101,8 +101,12 @@ async function doUp() {
   // Background default: LAN only. Opt into a public tunnel with `up --tunnel`.
   if (!fwd.includes('--tunnel')) fwd.push('--no-tunnel');
 
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  const out = fs.openSync(LOG_FILE, 'a');
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(STATE_DIR, 0o700); } catch { /* ignore */ }
+  // The log captures the server's startup banner, which prints the token/URL —
+  // keep it owner-only (chmod too, since the mode arg only applies on creation).
+  const out = fs.openSync(LOG_FILE, 'a', 0o600);
+  try { fs.chmodSync(LOG_FILE, 0o600); } catch { /* ignore */ }
   const child = spawn(process.execPath, [SELF, 'start', ...fwd], {
     detached: true,
     stdio: ['ignore', out, out],
