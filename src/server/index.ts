@@ -107,13 +107,13 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   // ─── Token Auth Helper ───
 
-  function isLocalRequest(req: any): boolean {
-    const remote = req.ip ?? req.socket?.remoteAddress ?? '';
-    return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
-  }
-
+  // Always require the token for /api and /ws. We deliberately do NOT trust a
+  // loopback source address as "authenticated": when reached through the
+  // Cloudflare tunnel (cloudflared → http://localhost:PORT) every request
+  // appears to come from 127.0.0.1, so a loopback bypass would hand the whole
+  // server to anyone who opened the public URL without a token. The client
+  // always carries the token, and LAN phones (non-loopback) already required it.
   function validateToken(req: any): boolean {
-    if (isLocalRequest(req)) return true;
     const token = (req.query as any)?.token ?? req.headers['x-cmux-token'];
     return token === accessToken;
   }
@@ -123,7 +123,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
   fastify.addHook('onRequest', async (req, reply) => {
     if (req.url === '/' || req.url.startsWith('/?token=')) return;
     if (req.url.startsWith('/app.js') || req.url.startsWith('/styles/') || req.url.startsWith('/sw.js') || req.url.startsWith('/manifest.json')) return;
-    if (req.url.startsWith('/api/') && !isLocalRequest(req)) {
+    if (req.url.startsWith('/api/')) {
       if (!validateToken(req)) {
         return reply.code(403).send({ error: 'Forbidden' });
       }
@@ -150,7 +150,7 @@ export async function createServer(config: Partial<ServerConfig> = {}) {
 
   fastify.register(async function (fastify) {
     fastify.get('/ws', { websocket: true }, (socket, req) => {
-      if (!isLocalRequest(req) && !validateToken(req)) {
+      if (!validateToken(req)) {
         socket.send(JSON.stringify({ type: 'error', data: 'Unauthorized: invalid token' }));
         socket.close();
         return;
